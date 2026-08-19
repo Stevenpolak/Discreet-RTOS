@@ -1,7 +1,7 @@
 # Two-task rewrite plan
 
-Status: in progress  
-Current phase: Phase 0/1 complete pending hardware bench verification — see [BASELINE.md](BASELINE.md) and [PHASE1_NOTES.md](PHASE1_NOTES.md); next up is Phase 2  
+Status: awaiting required hardware validation  
+Current phase: Phase 0/1 implementation complete, but their exit conditions are not met; do not start Phase 2 until the bench checklist below is recorded  
 Architecture target: one Arduino service loop plus one dedicated FreeRTOS control task
 
 This checklist is designed for work spread across multiple sessions. Finish and document one bounded step at a time; do not combine the architecture migration with unrelated behaviour changes.
@@ -15,7 +15,7 @@ Owns work that may be delayed briefly without affecting machine control:
 - Wi-Fi, mDNS and the web server
 - OTA handling
 - SD-card file management and uploads
-- Non-blocking buzzer sequencing
+- Timer-driven, non-blocking buzzer sequencing
 - Validation of requested setting changes
 - Sending commands/settings to the control task
 - Reading the latest immutable telemetry snapshot
@@ -101,7 +101,7 @@ Candidate fields include mode, shot state, temperature, pressure, elapsed shot t
 - [x] Record the exact imported upstream commit/tag. See [BASELINE.md](BASELINE.md).
 - [x] Build the current firmware unchanged. Compiles cleanly against `esp32:esp32@2.0.17`; see [BASELINE.md](BASELINE.md).
 - [x] Record ESP32 board/core version and all library versions. See [BASELINE.md](BASELINE.md).
-- [x] Record pin mapping and hardware variants used for testing. See [BASELINE.md](BASELINE.md).
+- [ ] Record pin mapping and hardware variants used for testing. Pin mapping is documented in [BASELINE.md](BASELINE.md), but no physical test variant has been identified yet.
 - [x] Document safe boot outputs: heater off and pump off until initialized. Documented from source; **not yet bench-verified** — see [BASELINE.md](BASELINE.md) "Safe boot outputs".
 - [x] Document fault behaviour for invalid temperature, invalid pressure, over-temperature, time-out and watchdog reset. See [BASELINE.md](BASELINE.md) "Fault behaviour"; several gaps identified and carried forward, not fixed in Phase 0.
 - [x] Create a baseline tag or branch. Tag `baseline-phase0`.
@@ -111,13 +111,15 @@ Exit condition: **partially met**. The unmodified baseline builds and its essent
 
 ### Phase 1 — Remove blocking and loop-count timing
 
-- [x] Replace buzzer delays with a timestamp-driven non-blocking sequencer. See [PHASE1_NOTES.md](PHASE1_NOTES.md).
+- [x] Replace buzzer delays with a timer-driven non-blocking sequencer. See [PHASE1_NOTES.md](PHASE1_NOTES.md).
 - [x] Replace loop-count-based timing such as `offcount` with elapsed time or a timestamp derived from the relevant signal. See [PHASE1_NOTES.md](PHASE1_NOTES.md); the new debounce constant needs bench confirmation.
 - [x] Audit web, SD and OTA paths for blocking calls that could affect migration. See [PHASE1_NOTES.md](PHASE1_NOTES.md); documented, not changed — deferred to later phases.
-- [x] Keep machine behaviour unchanged in this phase. Preserved by construction (see [PHASE1_NOTES.md](PHASE1_NOTES.md) "Behaviour-preservation checklist"); not yet bench-confirmed.
+- [ ] Keep machine behaviour unchanged in this phase. The intended equivalence is documented in [PHASE1_NOTES.md](PHASE1_NOTES.md), but cannot be checked off before bench confirmation. In particular, 300 ms is a new explicit debounce value rather than a measured equivalent of the old 100-loop count.
 - [ ] Re-run the baseline tests. **Not done** — same hardware limitation as Phase 0.
 
-Exit condition: **partially met**. No control behaviour depends on loop iteration speed any more, and the firmware builds; bench re-testing is still required before deployment.
+Exit condition: **not yet met**. The implementation builds and removes the
+known loop-count dependency, but Phase 2 remains gated on the Phase 0/1 bench
+tests, safe-output measurement, buzzer check and `AC_OFF_DEBOUNCE_MS` tuning.
 
 ### Phase 2 — Introduce explicit state and data models
 
@@ -249,4 +251,4 @@ Rules for incremental work:
 |---|---|---|---|---|
 | 2026-08-19 | Planning | Initial documentation | Two-task architecture and staged plan recorded | Start Phase 0 and capture the imported baseline |
 | 2026-08-19 | Planning | Documentation update | Added explicit Task WDT subscription, SSR deadman contract and latched mid-shot settings | Carry these contracts into Phase 0 safety criteria |
-| 2026-08-19 | Phase 0 + 1 | `phase0-1-baseline-and-deblocking`, see PR | Recorded imported commit (`b6ffbae`), pin mapping, safe-boot/fault-behaviour gaps and a `baseline-phase0` tag; confirmed the unmodified baseline only builds against `esp32:esp32@2.0.17` (3.x breaks `dimmable_light`'s timer API usage). Replaced the blocking buzzer and the loop-count `offcount` shot-end debounce with non-blocking/timestamp-driven equivalents; audited remaining blocking calls in web/SD/OTA paths and documented rather than changed them. Both baseline and modified firmware compile cleanly. **No physical hardware was available in this environment**, so the bench test record (temp-only and normal-shot behaviour, safe-boot measurement, `AC_OFF_DEBOUNCE_MS` validation) is an open item, not completed. | Bench-verify this PR's behaviour-preservation claims on real hardware, then start Phase 2 (explicit `OperatingMode`/`ShotState`/settings structs) |
+| 2026-08-19 | Phase 0 + 1 | `phase0-1-baseline-and-deblocking`, see PR | Recorded imported commit (`b6ffbae`), pin mapping, safe-boot/fault-behaviour gaps and a `baseline-phase0` tag; confirmed the unmodified baseline only builds against `esp32:esp32@2.0.17` (3.x breaks `dimmable_light`'s timer API usage). Replaced the blocking buzzer and loop-count shot-end debounce; audited blocking service paths. Review then moved buzzer edges to the ESP timer service so a blocking service handler cannot stretch an ON pulse, corrected the actuator-ownership baseline, and expanded the blocking audit. **No physical hardware was available**, so Phase 0/1 exit conditions remain open. | Bench-test temp-only and a normal shot; measure safe boot outputs; verify buzzer patterns; tune `AC_OFF_DEBOUNCE_MS`; only then start Phase 2. |
