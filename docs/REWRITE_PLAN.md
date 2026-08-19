@@ -68,6 +68,20 @@ Use a bounded FreeRTOS queue from the service loop to the control task. Commands
 
 Only the control task commits settings that affect control behaviour. Acknowledge accepted/rejected changes through telemetry or a small response mechanism.
 
+### Settings lifecycle
+
+Control and profile settings are frozen for the duration of a shot.
+
+- Keep separate `activeSettings` and `pendingSettings` value snapshots with revision numbers.
+- When a shot starts, latch the complete active settings snapshot into `shotSettings`.
+- Every shot phase uses only `shotSettings`; web edits never mutate it.
+- A valid edit received during `PREINFUSION`, `BLOOM`, `EXTRACTION` or `COMPLETE` updates `pendingSettings` only.
+- After the shot returns to `IDLE`, atomically promote the latest pending revision to `activeSettings`.
+- Telemetry reports active, shot and pending revision numbers so the UI can show that a change is queued.
+- Safety limits, fault actions and emergency shutdown commands are not deferred and always take effect immediately.
+
+This means that changing brew temperature, pressure or a phase duration mid-shot cannot alter the shot already in progress; the latest valid change becomes active for the next shot.
+
 ### Telemetry
 
 Use a queue of length 1 containing a value-only `TelemetrySnapshot`.
@@ -113,6 +127,8 @@ Exit condition: the current single-loop firmware remains functionally equivalent
 - [ ] Define value-only `ControlSettings`, `ControlCommand` and `TelemetrySnapshot` structs.
 - [ ] Define allowed state transitions and entry/exit actions.
 - [ ] Define settings ranges, units and revision handling.
+- [ ] Define `activeSettings`, immutable per-shot `shotSettings` and latest-value `pendingSettings`.
+- [ ] Define the atomic `pendingSettings -> activeSettings` promotion on return to `IDLE`.
 - [ ] Add human-readable fault codes.
 
 Exit condition: modes, states, settings, commands and telemetry have explicit definitions without yet requiring a second task.
@@ -136,6 +152,8 @@ Exit condition: a single function owns all control decisions and actuator writes
 - [ ] Read telemetry with `xQueuePeek()`.
 - [ ] Ensure queue operations used by either task are non-blocking or tightly bounded.
 - [ ] Reject unsafe or invalid settings inside the control owner.
+- [ ] Queue valid mid-shot edits as pending without changing `shotSettings`.
+- [ ] Coalesce repeated edits so the latest complete pending revision wins.
 - [ ] Test command bursts and slow/unavailable web clients.
 - [ ] Confirm no shared mutable control globals remain.
 
@@ -148,24 +166,33 @@ Exit condition: all cross-boundary data is copied through defined messages.
 - [ ] Schedule 50 ms pressure work and 250 ms temperature/PID work inside the task.
 - [ ] Keep zero-cross dimmer timing in the library interrupt path.
 - [ ] Choose task priority, core affinity and stack size deliberately; document the reason.
+- [ ] Explicitly subscribe the control task to the ESP Task Watchdog with `esp_task_wdt_add(NULL)` from inside that task; do not rely on the watched idle tasks.
+- [ ] Feed the Task WDT with `esp_task_wdt_reset()` only after a complete successful control cycle, including safety evaluation and actuator/deadman refresh.
+- [ ] Check and handle the return values of the Task WDT API calls.
 - [ ] Measure worst observed cycle time and deadline misses.
 - [ ] Measure stack high-water mark.
-- [ ] Verify watchdog behaviour and safe recovery.
+- [ ] Verify that deliberately wedging the control task triggers the intended watchdog recovery and leaves outputs safe.
 - [ ] Stress Wi-Fi, web requests, SD access and OTA preparation during a simulated/bench shot.
 
-Exit condition: control timing remains deterministic under service-side load and no deadline or stack problems are observed.
+Exit condition: control timing remains deterministic under service-side load, the control task itself is watched by the Task WDT, and no deadline or stack problems are observed.
 
 ### Phase 6 — Consider time-proportional SSR output separately
 
-This is a useful behaviour improvement but should not be mixed into the task migration.
+This is a useful behaviour improvement but should not be mixed into the task migration. Its interface should already be designed as a deadman: heater output is a short-lived authorization, not a persistent level.
 
 - [ ] Define a safe SSR time window appropriate for the heater and SSR.
 - [ ] Convert the full PID output range to an on-time fraction instead of switching at a fixed value of 127.
-- [ ] Ensure over-temperature, invalid sensor and fault states override the window immediately.
+- [ ] Make every window authorization expire automatically at its deadline.
+- [ ] Require the control task to re-arm/refresh the next window after each successful control period.
+- [ ] Enforce expiry in a timer/driver path that continues to turn the SSR off if the control task is wedged.
+- [ ] Never re-arm before current temperature data and all safety checks have passed.
+- [ ] Clear the current authorization immediately on fault, invalid sensor, over-temperature, mode transition, OTA start or shutdown.
+- [ ] Ensure a stale timestamp, missed refresh or invalid authorization always maps to SSR off.
+- [ ] Validate the deadman by deliberately stopping control-task refresh and measuring the maximum time until SSR off.
 - [ ] Validate heater response and retune PID only if measurements show it is necessary.
 - [ ] Keep this change in a separate commit or pull request.
 
-Exit condition: the SSR uses the available PID resolution and safety-off behaviour is unchanged or stronger.
+Exit condition: the SSR uses the available PID resolution, every authorization expires without refresh, and a stalled control task cannot leave the heater continuously energized.
 
 ### Phase 7 — Verification
 
@@ -177,6 +204,9 @@ Exit condition: the SSR uses the available PID resolution and safety-off behavio
 - [ ] Invalid pressure sensor prevents unsafe pump regulation.
 - [ ] Over-temperature and all time-outs force safe outputs.
 - [ ] Reboot, task failure and watchdog reset leave heater and pump off.
+- [ ] A deliberately wedged control task is detected because that task is explicitly subscribed to the Task WDT.
+- [ ] Loss of SSR refresh makes the heater output decay to off within the documented maximum window.
+- [ ] Mid-shot settings edits do not change the active shot and the latest valid pending revision becomes active after return to `IDLE`.
 - [ ] Wi-Fi loss does not disturb control timing.
 - [ ] Missing/failing SD card does not disturb control timing.
 - [ ] Large web requests/uploads do not disturb control timing.
@@ -218,3 +248,4 @@ Rules for incremental work:
 | Date | Phase | Branch/commit | Result | Next step |
 |---|---|---|---|---|
 | 2026-08-19 | Planning | Initial documentation | Two-task architecture and staged plan recorded | Start Phase 0 and capture the imported baseline |
+| 2026-08-19 | Planning | Documentation update | Added explicit Task WDT subscription, SSR deadman contract and latched mid-shot settings | Carry these contracts into Phase 0 safety criteria |
