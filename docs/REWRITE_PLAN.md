@@ -1,7 +1,7 @@
 # Two-task rewrite plan
 
-Status: planning  
-Current phase: Phase 0 — baseline and safety  
+Status: in progress  
+Current phase: Phase 0/1 complete pending hardware bench verification — see [BASELINE.md](BASELINE.md) and [PHASE1_NOTES.md](PHASE1_NOTES.md); next up is Phase 2  
 Architecture target: one Arduino service loop plus one dedicated FreeRTOS control task
 
 This checklist is designed for work spread across multiple sessions. Finish and document one bounded step at a time; do not combine the architecture migration with unrelated behaviour changes.
@@ -98,26 +98,26 @@ Candidate fields include mode, shot state, temperature, pressure, elapsed shot t
 
 ### Phase 0 — Establish a safe baseline
 
-- [ ] Record the exact imported upstream commit/tag.
-- [ ] Build the current firmware unchanged.
-- [ ] Record ESP32 board/core version and all library versions.
-- [ ] Record pin mapping and hardware variants used for testing.
-- [ ] Document safe boot outputs: heater off and pump off until initialized.
-- [ ] Document fault behaviour for invalid temperature, invalid pressure, over-temperature, time-out and watchdog reset.
-- [ ] Create a baseline tag or branch.
-- [ ] Capture a short test record of current temp-only and normal-shot behaviour.
+- [x] Record the exact imported upstream commit/tag. See [BASELINE.md](BASELINE.md).
+- [x] Build the current firmware unchanged. Compiles cleanly against `esp32:esp32@2.0.17`; see [BASELINE.md](BASELINE.md).
+- [x] Record ESP32 board/core version and all library versions. See [BASELINE.md](BASELINE.md).
+- [x] Record pin mapping and hardware variants used for testing. See [BASELINE.md](BASELINE.md).
+- [x] Document safe boot outputs: heater off and pump off until initialized. Documented from source; **not yet bench-verified** — see [BASELINE.md](BASELINE.md) "Safe boot outputs".
+- [x] Document fault behaviour for invalid temperature, invalid pressure, over-temperature, time-out and watchdog reset. See [BASELINE.md](BASELINE.md) "Fault behaviour"; several gaps identified and carried forward, not fixed in Phase 0.
+- [x] Create a baseline tag or branch. Tag `baseline-phase0`.
+- [ ] Capture a short test record of current temp-only and normal-shot behaviour. **Not done** — no physical hardware was available in this environment. This remains open and must be completed on a bench before Phase 1+ firmware runs on real hardware.
 
-Exit condition: the unmodified baseline builds and its essential behaviour is recorded.
+Exit condition: **partially met**. The unmodified baseline builds and its essential behaviour is documented from source, but the bench test record is an open item, not a completed one — see [BASELINE.md](BASELINE.md) for the full list of open risks.
 
 ### Phase 1 — Remove blocking and loop-count timing
 
-- [ ] Replace buzzer delays with a timestamp-driven non-blocking sequencer.
-- [ ] Replace loop-count-based timing such as `offcount` with elapsed time or a timestamp derived from the relevant signal.
-- [ ] Audit web, SD and OTA paths for blocking calls that could affect migration.
-- [ ] Keep machine behaviour unchanged in this phase.
-- [ ] Re-run the baseline tests.
+- [x] Replace buzzer delays with a timestamp-driven non-blocking sequencer. See [PHASE1_NOTES.md](PHASE1_NOTES.md).
+- [x] Replace loop-count-based timing such as `offcount` with elapsed time or a timestamp derived from the relevant signal. See [PHASE1_NOTES.md](PHASE1_NOTES.md); the new debounce constant needs bench confirmation.
+- [x] Audit web, SD and OTA paths for blocking calls that could affect migration. See [PHASE1_NOTES.md](PHASE1_NOTES.md); documented, not changed — deferred to later phases.
+- [x] Keep machine behaviour unchanged in this phase. Preserved by construction (see [PHASE1_NOTES.md](PHASE1_NOTES.md) "Behaviour-preservation checklist"); not yet bench-confirmed.
+- [ ] Re-run the baseline tests. **Not done** — same hardware limitation as Phase 0.
 
-Exit condition: the current single-loop firmware remains functionally equivalent but no control behaviour depends on loop iteration speed.
+Exit condition: **partially met**. No control behaviour depends on loop iteration speed any more, and the firmware builds; bench re-testing is still required before deployment.
 
 ### Phase 2 — Introduce explicit state and data models
 
@@ -249,3 +249,4 @@ Rules for incremental work:
 |---|---|---|---|---|
 | 2026-08-19 | Planning | Initial documentation | Two-task architecture and staged plan recorded | Start Phase 0 and capture the imported baseline |
 | 2026-08-19 | Planning | Documentation update | Added explicit Task WDT subscription, SSR deadman contract and latched mid-shot settings | Carry these contracts into Phase 0 safety criteria |
+| 2026-08-19 | Phase 0 + 1 | `phase0-1-baseline-and-deblocking`, see PR | Recorded imported commit (`b6ffbae`), pin mapping, safe-boot/fault-behaviour gaps and a `baseline-phase0` tag; confirmed the unmodified baseline only builds against `esp32:esp32@2.0.17` (3.x breaks `dimmable_light`'s timer API usage). Replaced the blocking buzzer and the loop-count `offcount` shot-end debounce with non-blocking/timestamp-driven equivalents; audited remaining blocking calls in web/SD/OTA paths and documented rather than changed them. Both baseline and modified firmware compile cleanly. **No physical hardware was available in this environment**, so the bench test record (temp-only and normal-shot behaviour, safe-boot measurement, `AC_OFF_DEBOUNCE_MS` validation) is an open item, not completed. | Bench-verify this PR's behaviour-preservation claims on real hardware, then start Phase 2 (explicit `OperatingMode`/`ShotState`/settings structs) |

@@ -62,6 +62,14 @@ double currentPressure = 0;
 const int PRESS_INTERVAL = 50;  // X ms
 const int PID_INTERVAL = 250;  // X ms
 
+// AC-off debounce: how long syncPin must read continuously HIGH (off) before a
+// shot is considered ended. Replaces a loop-iteration counter (previously 100
+// iterations) so shot-end detection no longer depends on loop() speed.
+// TODO(bench): 300 ms approximates the old iteration-count debounce under
+// typical loop timing observed during development; confirm on hardware before
+// relying on it (see docs/PHASE1_NOTES.md).
+const unsigned long AC_OFF_DEBOUNCE_MS = 300;
+
 // Timer Variables
 unsigned long lastPIDTime = 0;
 unsigned long DimlastUpdate = 0;
@@ -87,9 +95,66 @@ bool pumpPowerSetPreinf = false;
 bool pumpPowerSetExtraction = false;
 
 int bloomtime = 0;
-int offcount = 0;
+// 0 means "AC has been continuously on"; a non-zero value is the millis()
+// timestamp when syncPin was first observed reading HIGH (off) since it was
+// last LOW (on). Replaces the old loop-iteration offcount.
+unsigned long acOffSince = 0;
 
 DimmableLight light(thyristorPin);
+
+// --- Non-blocking buzzer sequencer -----------------------------------------
+// Replaces beepBuzzer()'s delay()-based blocking loop. queueBuzzer() starts a
+// pattern; serviceBuzzer() must be called every loop() iteration to advance
+// it. waitForBuzzer() blocks until the pattern finishes and is only used
+// during setup(), before loop() begins, to preserve the original boot-time
+// beep timing without duplicating the sequencing logic.
+bool buzzerActive = false;
+bool buzzerPinOn = false;
+int buzzerBeepsRemaining = 0;
+int buzzerOnMs = 0;
+int buzzerOffMs = 0;
+unsigned long buzzerPhaseStart = 0;
+
+void queueBuzzer(int times, int beepDurationMs, int pauseDurationMs) {
+  if (times <= 0) return;
+  buzzerOnMs = beepDurationMs;
+  buzzerOffMs = pauseDurationMs;
+  buzzerBeepsRemaining = times;
+  buzzerPinOn = true;
+  buzzerActive = true;
+  buzzerPhaseStart = millis();
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+void serviceBuzzer() {
+  if (!buzzerActive) return;
+
+  unsigned long now = millis();
+  unsigned long phaseDuration = buzzerPinOn ? (unsigned long)buzzerOnMs : (unsigned long)buzzerOffMs;
+  if (now - buzzerPhaseStart < phaseDuration) return;
+
+  if (buzzerPinOn) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerPinOn = false;
+    buzzerPhaseStart = now;
+  } else {
+    buzzerBeepsRemaining--;
+    if (buzzerBeepsRemaining <= 0) {
+      buzzerActive = false;
+      return;
+    }
+    digitalWrite(BUZZER_PIN, HIGH);
+    buzzerPinOn = true;
+    buzzerPhaseStart = now;
+  }
+}
+
+void waitForBuzzer() {
+  while (buzzerActive) {
+    serviceBuzzer();
+    delay(1);
+  }
+}
 
 //Functions
 void handleApplyTheme() {
@@ -310,16 +375,6 @@ void handlePressure() {
   server.send(200, "text/plain", String(currentPressure, 2));
 }
 
-void beepBuzzer(int times, int beepDuration, int pauseDuration) {
-
-  for (int i = 0; i < times; i++) {
-    digitalWrite(BUZZER_PIN, HIGH);  // Turn buzzer on
-    delay(beepDuration);
-    digitalWrite(BUZZER_PIN, LOW);   // Turn buzzer off
-    delay(pauseDuration);
-  }
-}
-
 void getCurrentTheme() {
 
     if (!SD.exists("/currentTheme.txt")) {
@@ -517,14 +572,18 @@ void setupServerRoutes() {
 }
 
 void startSD(){
+  // Called only from setup(), before loop() begins, so blocking here to keep
+  // the original boot-time beep timing is safe (nothing else needs to run
+  // concurrently yet).
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS)) {
     Serial.println("SD card initialization failed!");
-    beepBuzzer(3,1000,200);
+    queueBuzzer(3,1000,200);
   } else {
     Serial.println("SD card initialized.");
-    beepBuzzer(1,100,100);
+    queueBuzzer(1,100,100);
   }
+  waitForBuzzer();
 }
 
 void loadSDConfig() {
@@ -580,23 +639,27 @@ void startWiFi(){
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    beepBuzzer(5,1000,200);
+    queueBuzzer(5,1000,200);
     Serial.println("FAILED connecting to WiFi");
   } else {
-    beepBuzzer(1,500,100);
+    queueBuzzer(1,500,100);
     Serial.println("WiFi Connected!");
     WiFi.config(WiFi.localIP(), IPAddress(0,0,0,0), WiFi.subnetMask(), IPAddress(0,0,0,0));
     Serial.println("IP:  " + WiFi.localIP().toString());
     Serial.println("GW:  " + WiFi.gatewayIP().toString());
-    Serial.println("DNS: " + WiFi.dnsIP().toString());  
+    Serial.println("DNS: " + WiFi.dnsIP().toString());
   }
+  // Called only from setup(), before loop() begins; see startSD() note above.
+  waitForBuzzer();
 
 }
 
 void steam(){
 
   if (input > steamSetpoint - 5 && !steaming){
-    beepBuzzer(3,100,100);
+    // Called every loop() iteration; must not block control timing, so this
+    // only queues the pattern. serviceBuzzer() in loop() advances it.
+    queueBuzzer(3,100,100);
     steaming = true;
   }
   if (input < steamSetpoint - 20 && steaming){steaming = false;}
@@ -656,6 +719,7 @@ void loop() {
   GetPressure();
   runPID();
   steam();
+  serviceBuzzer();
 
   // AC detection
   if (digitalRead(syncPin) == LOW && !acDetected && !PIDonly) {
@@ -716,16 +780,20 @@ void loop() {
       else SetPump();
     }
 
-    // AC Turned off
-    if (digitalRead(syncPin) == HIGH) offcount++;
-    else offcount = 0;
+    // AC turned off: debounce over elapsed time rather than loop iterations,
+    // so shot-end detection no longer depends on how fast loop() is spinning.
+    if (digitalRead(syncPin) == HIGH) {
+      if (acOffSince == 0) acOffSince = millis();
+    } else {
+      acOffSince = 0;
+    }
 
-    if (offcount >= 100) {
+    if (acOffSince != 0 && millis() - acOffSince >= AC_OFF_DEBOUNCE_MS) {
       acDetected = false;
       shotStarted = false;
       pumpPowerSetPreinf = false;
       pumpPowerSetExtraction = false;
-      offcount = 0;
+      acOffSince = 0;
     }
   }
 }
