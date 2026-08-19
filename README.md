@@ -40,8 +40,10 @@ Zero-cross phase control remains interrupt-driven by the dimmer library.
 - **Pause/Resume is removed.** It is intentionally not represented as a shot state.
 - **Only the control task may write the pump/dimmer or heater/SSR.**
 - Settings travel to the control task through a bounded command queue.
+- Shot settings are latched at shot start. Valid mid-shot edits are held as the latest pending revision and applied atomically after the shot returns to `IDLE`; safety actions are always immediate.
 - The control task publishes a complete latest-value telemetry snapshot through a length-1 queue using `xQueueOverwrite()`; the service side reads it with `xQueuePeek()`.
-- A time-proportional SSR output is worth evaluating, but as a separate behaviour change after the task split is stable.
+- The control task must explicitly subscribe itself to the ESP Task WDT with `esp_task_wdt_add(NULL)` and feed it only after a complete successful cycle.
+- A time-proportional SSR output is worth evaluating as a separate behaviour change. It must act as a deadman: each short-lived heater authorization expires unless a healthy control cycle re-arms it.
 
 ## Roadmap and multi-session workflow
 
