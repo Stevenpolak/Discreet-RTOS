@@ -1,167 +1,72 @@
-# Discreet ☕
+# Discreet RTOS Refactor ☕
 
-An open-source ESP32-based espresso machine controller with PID temperature control, pressure profiling, pre-infusion, and a web UI served directly from an SD card. Designed on the Gaggia Classic Pro but compatible with any single boiler machine.
+Private development repository for an experimental two-task FreeRTOS refactor of the Discreet espresso-machine controller.
 
-Join the discord - discreetcoffee.co.uk
+> This project is derived from **[Discreet Coffee / Discreet](https://github.com/Discreet-Coffee/Discreet)**. All credit for the original project, firmware, hardware concept and web interface belongs to the Discreet Coffee project and its contributors. This repository is an independent development copy and does not imply endorsement by the upstream maintainers.
 
----
+## Original project
 
-## Features
+[Discreet](https://github.com/Discreet-Coffee/Discreet) is an open-source ESP32-based espresso-machine controller, designed around the Gaggia Classic Pro and usable with other single-boiler machines. Its features include:
 
-- **PID temperature control** — tunable Kp, Ki, Kd with SSR output
-- **Pressure profiling** — closed-loop pump control via a dimmer module, targeting user-defined bar setpoints
-- **Pre-infusion** — configurable pre-infusion time at a lower pressure before ramping to full pressure
-- **Bloom time** — configurable bloom/pause phase
-- **Web UI** — served from SD card, accessible via browser on your local network at `http://discreet.local`
-- **Live data** — real-time temperature, pressure, shot timer, and pump power
-- **Theme support** — swap CSS themes from the UI without reflashing
-- **OTA updates** — update firmware over Wi-Fi via Arduino OTA
-- **Buzzer feedback** — audible alerts on boot and error states
+- PID temperature control
+- pressure profiling and pump control
+- pre-infusion and bloom timing
+- a web UI served from SD card
+- live telemetry and adjustable settings
+- OTA firmware updates
+- buzzer feedback
 
----
+The imported source, tags and revision history have been retained. The original README is also preserved at [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
 
-## Hardware
+## Goal of this development copy
 
-| Component | Details |
-|---|---|
-| Microcontroller | ESP32 |
-| Temperature sensor | MAX6675 thermocouple |
-| Pressure sensor | Analog (0–12 bar), GPIO 34 |
-| Heater control | SSR (Solid State Relay), GPIO 13 |
-| Pump control | Dimmable light / TRIAC dimmer, GPIO 18/19 |
-| Storage | SD card via SPI |
-| Buzzer | GPIO 4 |
+The aim is to keep the current feature set while separating timing-critical coffee control from networking and file-service work. The design deliberately uses only two execution contexts:
 
-### Pin Reference
+1. Arduino `loop()` handles Wi-Fi, web server, OTA, SD-card management, a non-blocking buzzer, command submission and telemetry display.
+2. One dedicated FreeRTOS control task owns shot detection, the shot state machine, pressure/pump control, temperature/PID, safety checks and final actuator outputs.
 
-| Function | GPIO |
-|---|---|
-| SD CS | 32 |
-| SD MOSI | 25 |
-| SD MISO | 26 |
-| SD SCK | 33 |
-| SSR (heater) | 13 |
-| Dimmer sync | 19 |
-| Dimmer output | 18 |
-| Thermocouple CS | 22 |
-| Thermocouple CLK | 23 |
-| Thermocouple DO | 21 |
-| Pressure sensor | 34 |
-| Buzzer | 4 |
+The proposed control task runs on a 10 ms base cycle. Within that single task:
 
----
+- 10 ms: shot detection, state transitions and safety checks
+- 50 ms: pressure sampling and pump regulation
+- 250 ms: temperature sampling and PID
+- every cycle: safety overrides before pump and heater outputs
 
-## Software Dependencies
+Zero-cross phase control remains interrupt-driven by the dimmer library.
 
-- [Arduino ESP32](https://github.com/espressif/arduino-esp32)
-- [dimmable_light](https://github.com/fabianoriccardi/dimmable-light)
-- [MAX6675 library](https://github.com/adafruit/MAX6675-library)
-- [PID_v1](https://github.com/br3ttb/Arduino-PID-Library)
-- [ArduinoJson](https://arduinojson.org/)
-- [ArduinoOTA](https://github.com/jandrassy/ArduinoOTA)
-- ESPmDNS (bundled with ESP32 Arduino core)
+## Scope decisions
 
----
+- **Temp-only is retained.** The current `PIDonly` behaviour becomes a separate operating mode: temperature regulation stays active while shot detection and pump output remain disabled.
+- **Pause/Resume is removed.** It is intentionally not represented as a shot state.
+- **Only the control task may write the pump/dimmer or heater/SSR.**
+- Settings travel to the control task through a bounded command queue.
+- The control task publishes a complete latest-value telemetry snapshot through a length-1 queue using `xQueueOverwrite()`; the service side reads it with `xQueuePeek()`.
+- A time-proportional SSR output is worth evaluating, but as a separate behaviour change after the task split is stable.
 
-## Getting Started
+## Roadmap and multi-session workflow
 
-### 1. SD Card Setup
+See **[the staged rewrite plan](docs/REWRITE_PLAN.md)** for phase checklists, exit conditions, verification items and the session handoff log.
 
-Format the SD card as FAT32 and create a `config.json` file in the root:
+The intended sequence is:
 
-```json
-{
-  "ssid": "your_wifi_name",
-  "password": "your_wifi_password"
-}
-```
+1. capture and test the unchanged baseline
+2. remove blocking and loop-count timing
+3. introduce explicit modes, states and value-only messages
+4. centralize actuator ownership
+5. add command and telemetry queues
+6. move the control boundary into one FreeRTOS task
+7. validate timing and safety under service-side load
+8. consider the SSR improvement separately
+9. clean up, document and decide how to feed focused changes upstream
 
-Place your web UI files (`index.html`, `global.css`, JS files etc.) in the root of the SD card.
+## Safety status
 
-### 2. Flash the Firmware
+This is experimental firmware for mains-powered heating and pumping hardware. It is not ready for installation merely because it builds. Any change must be bench-tested with safe boot outputs, sensor-fault handling, over-temperature protection, time-outs and watchdog recovery verified before use on a machine.
 
-Open the project in Arduino IDE or PlatformIO, select your ESP32 board, and flash.
+## Credits and license
 
-### 3. Access the UI
+Original project: **[Discreet Coffee / Discreet](https://github.com/Discreet-Coffee/Discreet)**  
+Original project website/community: [discreetcoffee.co.uk](https://discreetcoffee.co.uk/)  
+Original authors and contributors: the Discreet Coffee maintainers and all contributors recorded in the preserved Git history.
 
-Once booted and connected to Wi-Fi, open a browser and navigate to:
-
-```
-http://discreet.local
-```
-
-Or use the IP address printed to the serial monitor.
-
----
-
-## Configuration
-
-Key variables at the top of the sketch you may want to adjust:
-
-| Variable | Default | Description |
-|---|---|---|
-| `setpoint` | `102` | Target boiler temp (°C). Includes offset. |
-| `offset` | `9` | Probe offset. If you ask for 93°C, set offset so `setpoint - offset = 93`. |
-| `pressuresetpoint` | `9` | Target brew pressure (bar) |
-| `PrePressureSetpoint` | `3` | Pre-infusion pressure (bar) |
-| `preinftime` | `8000` | Pre-infusion duration (ms) |
-| `Kp / Ki / Kd` | `48 / 8 / 50` | PID tuning values |
-
-### Temperature Offset
-
-The probe sits outside the boiler, so there's a difference between boiler temp and actual output temp. Tune the `offset` variable to compensate. If you request 93°C and your puck temp is off, adjust accordingly.
-
----
-
-## OTA Updates
-
-Firmware can be updated over Wi-Fi using Arduino OTA:
-
-- **Hostname:** `Discreet`
-- **Password:** `Discreet`
-
----
-
-## API Endpoints
-
-The ESP32 runs a local web server with the following endpoints:
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/getValues` | GET | Returns JSON of all live values |
-| `/adjust` | GET | Adjust a variable: `?var=setpoint&val=1` |
-| `/pressure` | GET | Returns current pressure as plain text |
-| `/listFiles` | GET | Lists files on SD card |
-| `/upload` | POST | Upload a file to SD card |
-| `/delete` | GET | Delete a file: `?name=filename` |
-| `/applyTheme` | GET | Apply a theme: `?name=theme.css` |
-| `/getCurrentTheme` | GET | Returns the currently active theme name |
-
-### Adjustable Variables via `/adjust`
-
-| `var` | `val` | Description |
-|---|---|---|
-| `setpoint` | ±int | Nudge target temperature |
-| `pressuresetpoint` | ±int | Nudge target pressure |
-| `preinftime` | ±int | Nudge pre-infusion time (ms) |
-| `bloomtime` | ±int | Nudge bloom time (ms) |
-| `steam` | — | Switch to steam mode (150°C) |
-| `stopsteam` | — | Return to brew mode (102°C) |
-| `Pause` | — | Cut pump power |
-| `Resume` | — | Restore pump power |
-
----
-
-## Notes
-
-- The SD card and WiFi share SPI and conflict on init. The sketch intentionally initialises the SD card twice — once before WiFi to read `config.json`, and again after WiFi connects. This is a known ESP32 SPI/WiFi interaction and is handled in the setup routine.
-- Pressure is only read during an active shot (AC detected). At idle, pressure reads as 0.
-- The pressure sensor reads 0 for the first 500ms of a shot to allow initial pressure transients to settle.
-
----
-
-## License
-
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
-
-You are free to use, modify, and distribute this project, but any derivative work must also be released under GPL v3.
+This derivative remains licensed under the **[GNU General Public License v3.0](LICENSE)**. The upstream license file is retained unchanged. When redistributing modified versions, preserve copyright and attribution notices, provide corresponding source as required by GPL-3.0, and clearly identify modifications.
