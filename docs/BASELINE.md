@@ -208,9 +208,13 @@ This is tracked as an open risk (see below), not a completed Phase 0 item.
 6. Exact board variant, core version, and library versions used on the
    physical reference hardware are not recorded upstream and have not been
    confirmed against the reconstructed toolchain in this document.
-7. `AC_OFF_DEBOUNCE_MS` (introduced in this PR's Phase 1 change, see
-   `PHASE1_NOTES.md`) approximates, but does not guarantee, the same
-   real-world shot-end timing as the previous loop-count debounce.
+7. `AC_OFF_DEBOUNCE_MS` and `AC_OFF_MIN_SAMPLES` (introduced in this PR's
+   Phase 1 change, see `PHASE1_NOTES.md`) approximate, but do not guarantee,
+   the same real-world shot-end timing as the previous loop-count debounce.
+   An initial elapsed-time-only version of this debounce was found during
+   review to be a real regression (a `loop()` stall could satisfy it in a
+   single sample) and was fixed before merge; see `PHASE1_NOTES.md`
+   "Review round 1" for the failure scenario and the fix.
 8. The project has no dependency manifest, so it silently depends on getting
    a compatible core/library combination by chance. `dimmable_light` 1.6.0
    (latest on the Library Manager) does not build against `esp32:esp32` 3.x;

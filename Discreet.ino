@@ -59,20 +59,36 @@ int maxPressure = 12;
 double currentPressure = 0;
 
 // Timeing Intervals
-const int PRESS_INTERVAL = 50;  // X ms
-const int PID_INTERVAL = 250;  // X ms
+const unsigned long PRESS_INTERVAL = 50;  // X ms
+const unsigned long PID_INTERVAL = 250;  // X ms
+
+// Pump-power ramp cadence used by SetPump(): replaces a "every 4th qualifying
+// call" counter with an explicit elapsed-time interval (4 x PRESS_INTERVAL,
+// matching the original cadence) so the ramp rate no longer depends on how
+// often SetPump() happens to be entered.
+const unsigned long PUMP_ADJUST_INTERVAL = 200;  // X ms
 
 // AC-off debounce: how long syncPin must read continuously HIGH (off) before a
 // shot is considered ended. Replaces a loop-iteration counter (previously 100
 // iterations) so shot-end detection no longer depends on loop() speed.
-// TODO(bench): 300 ms approximates the old iteration-count debounce under
-// typical loop timing observed during development; confirm on hardware before
-// relying on it (see docs/PHASE1_NOTES.md).
+//
+// Elapsed wall-clock time alone is not sufficient here: millis() keeps
+// advancing even while loop() is stalled (e.g. inside the SD/OTA paths
+// documented as blocking in docs/PHASE1_NOTES.md), so a stall could let a
+// single post-stall sample satisfy a pure time check. AC_OFF_MIN_SAMPLES
+// additionally requires that many real digitalRead() samples were taken
+// during the debounce window, so a stall bookended by only one or two
+// samples cannot end a shot on its own.
+// TODO(bench): both constants are judgement calls, not measurements against
+// real hardware; confirm on the bench before relying on them (see
+// docs/PHASE1_NOTES.md).
 const unsigned long AC_OFF_DEBOUNCE_MS = 300;
+const int AC_OFF_MIN_SAMPLES = 20;
 
 // Timer Variables
 unsigned long lastPIDTime = 0;
 unsigned long DimlastUpdate = 0;
+unsigned long lastPumpAdjust = 0;
 unsigned long LastPressCall = 0;
 unsigned long lastPrintTime = 0;
 unsigned long acDetectedTime = 0;
@@ -95,10 +111,14 @@ bool pumpPowerSetPreinf = false;
 bool pumpPowerSetExtraction = false;
 
 int bloomtime = 0;
-// 0 means "AC has been continuously on"; a non-zero value is the millis()
-// timestamp when syncPin was first observed reading HIGH (off) since it was
-// last LOW (on). Replaces the old loop-iteration offcount.
+// AC-off debounce state. acOffPending is true once syncPin has been observed
+// HIGH (off) at least once since it was last LOW (on); acOffSince is the
+// millis() timestamp of that first HIGH sample; acOffSamples counts how many
+// HIGH samples have actually been taken since then (see AC_OFF_MIN_SAMPLES).
+// Replaces the old loop-iteration offcount.
+bool acOffPending = false;
 unsigned long acOffSince = 0;
+int acOffSamples = 0;
 
 DimmableLight light(thyristorPin);
 
@@ -108,29 +128,33 @@ DimmableLight light(thyristorPin);
 // it. waitForBuzzer() blocks until the pattern finishes and is only used
 // during setup(), before loop() begins, to preserve the original boot-time
 // beep timing without duplicating the sequencing logic.
-bool buzzerActive = false;
+//
+// "Active" is buzzerBeepsRemaining > 0 - there is no separate active flag to
+// keep in sync. Calling queueBuzzer() while a pattern is already playing
+// overwrites it; every current call site either waits for the previous
+// pattern to finish first (waitForBuzzer()) or is latched so it cannot fire
+// again until the previous pattern's triggering condition clears (steam()).
 bool buzzerPinOn = false;
-int buzzerBeepsRemaining = 0;
-int buzzerOnMs = 0;
-int buzzerOffMs = 0;
+unsigned long buzzerBeepsRemaining = 0;
+unsigned long buzzerOnMs = 0;
+unsigned long buzzerOffMs = 0;
 unsigned long buzzerPhaseStart = 0;
 
 void queueBuzzer(int times, int beepDurationMs, int pauseDurationMs) {
-  if (times <= 0) return;
+  if (times <= 0 || beepDurationMs <= 0 || pauseDurationMs < 0) return;
   buzzerOnMs = beepDurationMs;
   buzzerOffMs = pauseDurationMs;
   buzzerBeepsRemaining = times;
   buzzerPinOn = true;
-  buzzerActive = true;
   buzzerPhaseStart = millis();
   digitalWrite(BUZZER_PIN, HIGH);
 }
 
 void serviceBuzzer() {
-  if (!buzzerActive) return;
+  if (buzzerBeepsRemaining == 0) return;
 
   unsigned long now = millis();
-  unsigned long phaseDuration = buzzerPinOn ? (unsigned long)buzzerOnMs : (unsigned long)buzzerOffMs;
+  unsigned long phaseDuration = buzzerPinOn ? buzzerOnMs : buzzerOffMs;
   if (now - buzzerPhaseStart < phaseDuration) return;
 
   if (buzzerPinOn) {
@@ -139,10 +163,7 @@ void serviceBuzzer() {
     buzzerPhaseStart = now;
   } else {
     buzzerBeepsRemaining--;
-    if (buzzerBeepsRemaining <= 0) {
-      buzzerActive = false;
-      return;
-    }
+    if (buzzerBeepsRemaining == 0) return;
     digitalWrite(BUZZER_PIN, HIGH);
     buzzerPinOn = true;
     buzzerPhaseStart = now;
@@ -150,7 +171,7 @@ void serviceBuzzer() {
 }
 
 void waitForBuzzer() {
-  while (buzzerActive) {
+  while (buzzerBeepsRemaining > 0) {
     serviceBuzzer();
     delay(1);
   }
@@ -465,15 +486,18 @@ int basePumpPowerForSetpoint(double Pumpsetpoint) {
 
 void SetPump() {
 
-  // Only update after boost every xxx ms
-  if (millis() - DimlastUpdate > PRESS_INTERVAL) {
-    DimlastUpdate = millis();
+  unsigned long now = millis();
 
-    static int callCount = 0;
-    callCount++;
-    // Slow - adjust pump power every 50ms (per count)
-    if (callCount >= 4) {
-      callCount = 0;
+  // Only update after boost every xxx ms
+  if (now - DimlastUpdate > PRESS_INTERVAL) {
+    DimlastUpdate = now;
+
+    // Slow - adjust pump power every PUMP_ADJUST_INTERVAL of elapsed time,
+    // not every Nth call: the previous "every 4th qualifying call" counter
+    // only meant ~200ms when this function was entered at least every
+    // PRESS_INTERVAL, which isn't guaranteed under loop() load.
+    if (now - lastPumpAdjust >= PUMP_ADJUST_INTERVAL) {
+      lastPumpAdjust = now;
       if (currentPressure < PressureTarget - 0.2) { pumppower = constrain(pumppower + 1, 120, 255); }
       else if (currentPressure > PressureTarget + 0.2) { pumppower = constrain(pumppower - 2, 120, 255); }
     }
@@ -780,20 +804,36 @@ void loop() {
       else SetPump();
     }
 
-    // AC turned off: debounce over elapsed time rather than loop iterations,
-    // so shot-end detection no longer depends on how fast loop() is spinning.
+    // AC turned off: require both elapsed wall-clock time AND a minimum
+    // number of actually-observed HIGH samples before ending the shot.
+    // Time alone is not safe here: millis() keeps advancing even while
+    // loop() is stalled (SD/OTA paths are still blocking - see
+    // docs/PHASE1_NOTES.md), so a stall could let a single post-stall
+    // sample satisfy a pure time check and end a live shot. Requiring
+    // AC_OFF_MIN_SAMPLES real samples means a stall bookended by only one
+    // or two samples cannot trigger this on its own - loop() actually has
+    // to keep running and keep reading syncPin as HIGH throughout.
     if (digitalRead(syncPin) == HIGH) {
-      if (acOffSince == 0) acOffSince = millis();
+      if (!acOffPending) {
+        acOffPending = true;
+        acOffSince = millis();
+        acOffSamples = 0;
+      }
+      acOffSamples++;
     } else {
-      acOffSince = 0;
+      acOffPending = false;
+      acOffSamples = 0;
     }
 
-    if (acOffSince != 0 && millis() - acOffSince >= AC_OFF_DEBOUNCE_MS) {
+    if (acOffPending && acOffSamples >= AC_OFF_MIN_SAMPLES &&
+        millis() - acOffSince >= AC_OFF_DEBOUNCE_MS) {
       acDetected = false;
       shotStarted = false;
       pumpPowerSetPreinf = false;
       pumpPowerSetExtraction = false;
-      acOffSince = 0;
+      light.setBrightness(0);
+      acOffPending = false;
+      acOffSamples = 0;
     }
   }
 }
