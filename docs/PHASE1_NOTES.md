@@ -6,29 +6,42 @@ Phase 0 baseline (`baseline-phase0` tag, see [BASELINE.md](BASELINE.md)).
 
 Goal: keep machine behaviour unchanged while removing the places control
 timing depended on `delay()` or on loop-iteration counts rather than
-wall-clock time. No FreeRTOS task, state model, or actuator-ownership change
-happens in this phase — that is Phases 2–5.
+wall-clock time. No application-owned FreeRTOS task, state model, or
+actuator-ownership change happens in this phase — that is Phases 2–5.
 
-**This PR went through an independent review round before being proposed for
-merge; see "Review round 1 findings and fixes" below.** The first version of
-this change had a real regression in the AC-off debounce (it could end a
+**This branch went through two rounds of independent review before being
+proposed for merge; see "Review round 1: findings and fixes" below.** The
+first version had a real regression in the AC-off debounce (it could end a
 live shot mid-extraction and restart it at full pump power, under exactly
 the kind of `loop()` stall this phase is trying to make control timing
-independent of) and left one other loop-count timing dependency
-(`SetPump()`'s `callCount`) unaddressed despite the Phase 1 exit condition
-claiming otherwise. Both are fixed in the version described below.
+independent of), left `SetPump()`'s `callCount` unaddressed despite the
+Phase 1 exit condition claiming otherwise, and left one documented,
+unresolved residual risk in the buzzer sequencer. All three are fixed in
+the version described below — the buzzer fix in particular came from a
+second, independently-authored change that arrived on this branch while the
+debounce/`callCount` fixes were being made, and the two were merged
+together rather than one overwriting the other.
 
-## 1. Buzzer: `delay()`-based blocking → non-blocking sequencer
+## 1. Buzzer: `delay()`-based blocking → timer-driven sequencer
 
 **Before:** `beepBuzzer(times, beepDuration, pauseDuration)` toggled
 `BUZZER_PIN` in a `for` loop using `delay()` between edges. Every call
 blocked whichever code path invoked it for the full pattern duration
 (e.g. `beepBuzzer(3,100,100)` blocks ~600 ms).
 
-**After:** a small state machine (`queueBuzzer()` / `serviceBuzzer()` /
-`waitForBuzzer()`) tracks the current beep phase against `millis()`.
-`serviceBuzzer()` is called once per `loop()` iteration and advances the
-pattern by at most one phase transition per call; it never blocks.
+**After:** `queueBuzzer()` starts a small state machine whose edges are
+driven by an ESP one-shot timer (`esp_timer_create` / `esp_timer_start_once`,
+dispatched on the ESP timer service task). The timer callback advances the
+pattern independently of Arduino `loop()`, guarded by a mutex shared with
+`queueBuzzer()`/`waitForBuzzer()` since state is now touched from two
+different task contexts. Consequently a slow HTTP, SD or OTA call cannot
+stretch an ON pulse or leave the pin stuck asserted — this closes what an
+earlier, simpler non-blocking design (a state machine serviced once per
+`loop()` iteration) could not: that version needed `loop()` to actually run
+to advance a beep, so a stall elsewhere could hold the pin on for the whole
+stall. This does not create a third application-owned task; it uses a
+platform service (`esp_timer`) that already exists. `waitForBuzzer()` only
+polls completion during setup, to retain the original boot sequence.
 
 **Call sites**, and why each is safe to leave as-is or was changed:
 
@@ -36,28 +49,21 @@ pattern by at most one phase transition per call; it never blocks.
   and `startWiFi()`: both only ever run during `setup()`, before `loop()`
   starts. Nothing else needs to run concurrently at that point, so these now
   call `queueBuzzer()` followed by `waitForBuzzer()` — a blocking wait, but
-  one built on the same non-blocking engine rather than a second, duplicate
-  timing implementation. Boot-time beep timing is unchanged from the
-  original behaviour.
+  the timer keeps driving the pattern in the background rather than a
+  duplicate timing implementation. Boot-time beep timing is unchanged from
+  the original behaviour.
 - `steam()`: called from every `loop()` iteration. This is the call site
   that mattered — the original blocking `beepBuzzer(3,100,100)` here could
   stall `GetPressure()`, `runPID()`, `SetPump()` and AC/shot-state handling
   for ~600 ms if steam threshold was crossed while other control logic
-  needed to run. It now calls `queueBuzzer()` only; `serviceBuzzer()` in
-  `loop()` advances the pattern without blocking anything else.
+  needed to run. It now calls `queueBuzzer()` only; timer callbacks advance
+  the pattern without blocking coffee logic and without depending on loop
+  latency.
 
-**Known residual risk, not fully closed by this phase:** `serviceBuzzer()`
-can only advance a phase when it is actually called. If a *later* `loop()`
-iteration blocks in one of the still-blocking paths in §3 below (SD
-streaming, upload, OTA) while a pattern is mid-flight, the pin holds
-whatever level it was last set to for the entire stall — e.g. a queued
-"beep" can sound continuously for seconds instead of the intended 100 ms.
-This cannot be fixed inside the buzzer engine itself without either
-reintroducing blocking (defeating the point of this change) or removing the
-underlying blocking calls (Phase 3+). It is a real, audible behaviour change
-from the baseline, but it is a sound-quality issue only — `BUZZER_PIN` is
-not shared with any actuator, so it cannot affect heater or pump output.
-Documented here rather than silently claimed as fully preserved.
+`queueBuzzer()` also now rejects a new pattern outright while one is already
+playing (checked under the mutex), matching the original blocking
+function's implicit "cannot overlap itself" contract, rather than silently
+truncating an in-flight pattern.
 
 ## 2. Shot-end detection: loop-count `offcount` → elapsed-time debounce
 
@@ -135,6 +141,12 @@ released, and that brief zero-cross artefacts don't false-trigger an early
 end. If bench testing shows different values are needed, change the two
 constants — the surrounding logic does not need to change.
 
+An architectural alternative worth considering in a later phase: derive
+off-time from the `dimmable_light` library's existing zero-cross interrupt
+instead of polling `syncPin` from `loop()`. That would remove the
+dependency on a bench-tuned constant entirely. Not done here to keep this
+PR's scope to timing-mechanism changes only, not new signal sources.
+
 ## 3. Pump-power ramp cadence: `SetPump()`'s `callCount` → elapsed-time interval
 
 Found during review, not part of the original scope for this PR but the
@@ -169,6 +181,10 @@ with where it is expected to actually be addressed.
 | `handleApplyTheme()` | Byte-by-byte `while (sourceFile.available()) targetFile.write(sourceFile.read());` file copy over SD SPI | Not addressed here; theme files are small, but this is a synchronous SD copy inside an HTTP handler. Candidate for a chunked/non-blocking copy if Phase 5 bench testing shows it disturbs control timing. |
 | `handleFileRequest()`, `/` route, `/getConfig` | `server.streamFile()` over SD SPI | Same — inherent to serving files from SD synchronously within `server.handleClient()`. `REWRITE_PLAN.md` Phase 7 explicitly requires verifying "large web requests/uploads do not disturb control timing" once control moves to its own task; until then this only matters because it currently shares the same loop as coffee control. |
 | `handleUpload()` | Per-chunk `uploadFile.write()` over SD SPI, called synchronously as HTTP body arrives | Same as above; flagged in `REWRITE_PLAN.md` Phase 7 verification list already. |
+| `handleListFiles()` | Synchronously walks the SD root and builds one in-memory JSON string | Move remains on the service side; stress-test a full card in Phase 7. |
+| `handleDelete()` | Synchronous `SD.exists()` and `SD.remove()` inside the request handler | Move remains on the service side; verify SD failures cannot affect control timing. |
+| `getCurrentTheme()` | Synchronous SD open plus `File.readString()` | Move remains on the service side; it must never be called from the control task. |
+| `/saveConfig` | Parses the complete request, removes and rewrites `config.json`, then mutates live PID/config globals | The SD work remains on the service side. Phase 3 must replace direct live-global mutation with validated requests; Phase 4 then carries copied settings through the command queue. |
 | `ArduinoOTA.handle()` | Blocks for extended periods while an OTA transfer is in progress (core library behaviour, not this firmware) | `REWRITE_PLAN.md` Phase 7 requires OTA to either refuse while unsafe or force a documented safe state; not solved by Phase 1. |
 | `startSD()` / `loadSDConfig()` / `startWiFi()` | `SPI.begin/end`, `SD.begin`, blocking Wi-Fi connect loop (`delay(500)` up to 20 s), boot delays (`delay(2000)` ×2) | Setup-time only, before `loop()` starts and before any actuator can be driven; out of scope for Phase 1 by the plan's own framing (control timing, not boot timing). |
 
@@ -178,11 +194,13 @@ deliberately rather than being rediscovered mid-migration.
 
 ## Review round 1: findings and fixes
 
-Before being proposed for merge, this PR was reviewed by an independent
+Before being proposed for merge, this branch was reviewed by an independent
 model (Opus) across 7 angles (correctness scan, removed-behaviour audit,
 cross-file trace, reuse, simplification, efficiency, altitude) with a
-verification pass on every candidate. 10 findings were reported; the ones
-that changed the code:
+verification pass on every candidate. 10 findings were reported. A second,
+independently-authored change also landed on this branch around the same
+time addressing the buzzer's residual risk directly (§1); the two efforts
+are reconciled below rather than one overwriting the other.
 
 1. **(fixed, was the most severe finding)** The AC-off debounce's first
    version used elapsed time alone and could be satisfied by a single
@@ -192,25 +210,33 @@ that changed the code:
    restarting the shot from pre-infusion at `pumppower = 255`. Fixed by
    requiring both elapsed time and a minimum count of actually-observed
    samples (§2 above).
-2. **(documented, not fully fixable in this phase)** `queueBuzzer()` can
-   leave `BUZZER_PIN` asserted for the duration of any blocking call that
-   runs before the next `serviceBuzzer()`. See the "known residual risk"
-   note in §1 above.
+2. **(fixed, superseded by a better design)** `queueBuzzer()` could leave
+   `BUZZER_PIN` asserted for the duration of any blocking call that ran
+   before the buzzer's state was next advanced. Originally documented here
+   as an accepted, undosable-within-this-phase risk. A second change
+   replaced the `loop()`-serviced state machine with the ESP-timer-driven
+   design in §1, which advances pattern edges independently of `loop()`
+   entirely and closes this risk rather than just documenting it.
 3. **(fixed)** `SetPump()`'s `callCount` was the same loop-count-timing
    defect class as `offcount`, left unaudited. Fixed in §3 above.
 4. **(fixed)** `queueBuzzer()` had no guard against a non-positive
-   duration, which would cast to a ~49-day value and could hang
-   `waitForBuzzer()` forever if hit from a setup-time call. Now validated
-   (`beepDurationMs <= 0 || pauseDurationMs < 0` is rejected). Currently
-   unreachable from any real call site (all pass positive literals), fixed
+   duration, which would cast to a very large duration and could hang
+   `waitForBuzzer()` forever if hit from a setup-time call. The final
+   timer-driven `queueBuzzer()` (§1) validates all of `times`,
+   `beepDurationMs` and `pauseDurationMs` before arming the timer. Currently
+   unreachable from any real call site (all pass positive literals); fixed
    as a latent landmine for future callers.
 5. **(fixed)** The `acOffSince == 0` sentinel collided with a legitimate
    `millis() == 0` value at the ~49.7-day rollover. Replaced with a
    dedicated `acOffPending` bool (§2 above); low real-world impact
    (self-healed within one iteration) but cheap to remove entirely.
-6. **(fixed as a side effect of the §2 rewrite)** `buzzerActive` was
-   redundant with `buzzerBeepsRemaining > 0`; collapsed to one fewer global
-   with no behaviour change.
+6. **(superseded)** An earlier fix collapsed a redundant `buzzerActive`
+   flag out of the `loop()`-serviced buzzer state machine. That state
+   machine was itself superseded by the timer-driven design in §1, which
+   reintroduces a `buzzerActive` flag — there it is load-bearing: it is the
+   guard, checked under a mutex, that both the timer callback and
+   `queueBuzzer()` use to coordinate across the two task contexts. No
+   redundant state remains in the final design.
 7. **(fixed)** Neither the old nor the first version of this PR called
    `light.setBrightness(0)` on shot end — a pre-existing gap, not
    introduced by this PR, but one the original debounce regression (finding
@@ -220,26 +246,34 @@ that changed the code:
    finding 1 and because leaving a known, freshly-identified pump-off gap
    in place once it was found would be irresponsible for actuator-adjacent
    code.
-8. **(not fixed, latent/low severity)** `queueBuzzer()` has no re-entrancy
-   guard against being called while a pattern is already playing. Currently
-   unreachable at all existing call sites; left as-is rather than adding
-   unneeded complexity for a scenario nothing can currently trigger.
-9. **(not fixed, architectural note for later phases)** `AC_OFF_DEBOUNCE_MS`
-   is a polled-elapsed-time constant; `REWRITE_PLAN.md`'s Phase 1 item also
+8. **(fixed by the same design change as finding 2)** `queueBuzzer()`
+   originally had no re-entrancy guard against being called while a pattern
+   was already playing — documented as latent/unreachable rather than
+   fixed. The timer-driven `queueBuzzer()` (§1) now explicitly rejects a
+   new pattern while one is active, matching the original blocking
+   function's implicit contract.
+9. **(not fixed, architectural note for later phases)** The AC-off debounce
+   is a polled-elapsed-time mechanism; `REWRITE_PLAN.md`'s Phase 1 item also
    allowed deriving off-time from the signal itself (the `dimmable_light`
-   library's existing zero-cross interrupt). That would remove the
-   dependency on a bench-tuned constant entirely and is likely closer to
-   what Phase 3+ needs anyway — flagged as a candidate for revisiting there
-   rather than expanding this PR's scope now.
+   library's existing zero-cross interrupt), which the buzzer fix (finding
+   2) demonstrates is a viable pattern in this codebase. That would remove
+   the dependency on bench-tuned debounce constants entirely and is likely
+   closer to what Phase 3+ needs anyway — flagged as a candidate for
+   revisiting there rather than expanding this PR's scope now.
+10. **(not fixed, low severity, pre-existing)** The actuator-ownership
+    baseline understated: `SSR_PIN` is written only by `runPID()`, but pump
+    output is written both from the shot state machine and directly from
+    the legacy `/adjust` `Pause`/`Resume` commands (`handleAdjust()`). This
+    is an existing split-ownership gap, not introduced by this PR — Phase 2
+    removes Pause/Resume entirely and Phase 3 makes the control boundary
+    the sole actuator writer. Corrected in `BASELINE.md`.
 
 ## Behaviour-preservation checklist
 
-- [x] Buzzer patterns play with the same on/off timing as before when
-      `loop()` isn't stalled, and setup-time callers still wait for the
-      pattern to finish, matching original boot timing. **Exception:** a
-      pattern can be stretched or held on by a blocking call elsewhere in
-      `loop()` — see the "known residual risk" note in §1. Sound-quality
-      only; cannot affect heater/pump output.
+- [x] The programmed buzzer durations and final trailing pause match the
+      old sequence, and pattern edges no longer depend on `loop()` latency
+      at all — a blocking web/SD/OTA call can no longer stretch or hold a
+      beep (review round 1, findings 2 and 8).
 - [x] Shot-end reset-on-any-"on"-reading semantics preserved exactly.
 - [x] Shot-end debounce no longer trusts elapsed time alone; requires
       actually-observed samples too, so a `loop()` stall cannot end a live
@@ -250,8 +284,12 @@ that changed the code:
       more consequential if left in place.
 - [x] `SetPump()`'s pump-power ramp cadence no longer depends on how often
       `SetPump()` happens to be entered (review round 1, finding 3).
-- [x] No FreeRTOS task, queue, state enum, or actuator-ownership change in
-      this PR.
+- [x] No application-owned FreeRTOS task, queue, state enum, or
+      actuator-ownership change in this PR (the buzzer uses the ESP timer
+      service, a platform facility, not a task this application owns).
+- [ ] Confirm buzzer sound/timing and all machine behaviour on hardware;
+      code review and compilation alone do not establish behavioural
+      equivalence.
 - [ ] Bench re-test of temp-only and a normal shot (see `BASELINE.md` —
       not performed in this environment; required before this firmware runs
       on real hardware, and again after `AC_OFF_DEBOUNCE_MS`/
@@ -261,14 +299,15 @@ that changed the code:
 
 Compiled with the same toolchain as the baseline (`esp32:esp32@2.0.17`; see
 `BASELINE.md` for why that core version rather than the newest 3.3.11 was
-used):
+used), after merging both rounds of fixes:
 
 ```
-Sketch uses 903269 bytes (68%) of program storage space. Maximum is 1310720 bytes.
-Global variables use 51204 bytes (15%) of dynamic memory, leaving 276476 bytes for local variables. Maximum is 327680 bytes.
+Sketch uses 903633 bytes (68%) of program storage space. Maximum is 1310720 bytes.
+Global variables use 51212 bytes (15%) of dynamic memory, leaving 276468 bytes for local variables. Maximum is 327680 bytes.
 ```
 
-No compiler errors or warnings. Flash/RAM usage is essentially unchanged
-from the baseline (+312 bytes flash, +16 bytes RAM), consistent with the
-buzzer state machine, the dual-gate AC-off debounce, and the elapsed-time
-pump-ramp cadence added by this PR and its review-round fixes.
+No compiler errors or warnings. Compared with the unmodified baseline
+(`baseline-phase0`: 902957 bytes flash, 51188 bytes RAM — see
+`BASELINE.md`), this adds 676 bytes of flash and 24 bytes of RAM: the
+timer-driven buzzer sequencer, the dual-gate AC-off debounce, and the
+elapsed-time pump-ramp cadence.

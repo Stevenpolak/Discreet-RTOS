@@ -19,10 +19,9 @@ Phase 1+ firmware is installed on a real machine.
   — "13 Bar Max enabled to Clear Discharge Tube", authored 2026-06-25T05:00:19Z.
 - This is one commit past upstream tag `V1.7.1` (which points at the parent
   commit `8c2d8b4`). No newer upstream tag exists as of this writing.
-- `Discreet.ino` in this repository is byte-identical to upstream `b6ffbae`
-  (`git diff b6ffbae HEAD -- Discreet.ino` is empty). All commits in this
-  repository since import (`c189bd0` onward) are documentation-only; no
-  firmware behaviour changed prior to the Phase 1 work in this same PR.
+- `Discreet.ino` at tag `baseline-phase0` is byte-identical to upstream
+  `b6ffbae` (`git diff b6ffbae baseline-phase0 -- Discreet.ino` is empty).
+  Later commits on the PR branch contain the Phase 1 firmware changes.
 - Baseline tag: `baseline-phase0`, created at `aa69af4` (last commit before
   Phase 1 code changes; firmware content identical to the imported `b6ffbae`).
 
@@ -146,9 +145,11 @@ From source reading only (bench measurement not performed):
   what the thyristor line does before `DimmableLight::begin()` runs, was
   not verified here. **Open item:** confirm on the bench that the pump does
   not fire before initialization completes.
-- Both actuators are exclusively driven from the `acDetected` shot branch or
-  `runPID()`; no other code path writes to `SSR_PIN` or calls
-  `light.setBrightness()`.
+- The heater is written only by `runPID()`. Pump output is normally written
+  from the `acDetected` shot branch, but the current `/adjust` handler also
+  writes it directly for the legacy `Pause` and `Resume` commands. That is an
+  existing split-ownership gap; Phase 2 removes Pause/Resume and Phase 3 makes
+  the control boundary the sole actuator writer.
 
 ## Fault behaviour
 

@@ -9,6 +9,7 @@
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
+#include <esp_timer.h>
 
 
 // Wi-Fi Variables
@@ -122,57 +123,84 @@ int acOffSamples = 0;
 
 DimmableLight light(thyristorPin);
 
-// --- Non-blocking buzzer sequencer -----------------------------------------
-// Replaces beepBuzzer()'s delay()-based blocking loop. queueBuzzer() starts a
-// pattern; serviceBuzzer() must be called every loop() iteration to advance
-// it. waitForBuzzer() blocks until the pattern finishes and is only used
-// during setup(), before loop() begins, to preserve the original boot-time
-// beep timing without duplicating the sequencing logic.
-//
-// "Active" is buzzerBeepsRemaining > 0 - there is no separate active flag to
-// keep in sync. Calling queueBuzzer() while a pattern is already playing
-// overwrites it; every current call site either waits for the previous
-// pattern to finish first (waitForBuzzer()) or is latched so it cannot fire
-// again until the previous pattern's triggering condition clears (steam()).
+// --- Timer-driven buzzer sequencer -----------------------------------------
+// An ESP one-shot timer advances the pattern independently of loop(), so a
+// slow web, SD or OTA call cannot stretch an ON pulse. This uses the ESP timer
+// service, not another application-owned FreeRTOS task.
+volatile bool buzzerActive = false;
 bool buzzerPinOn = false;
-unsigned long buzzerBeepsRemaining = 0;
-unsigned long buzzerOnMs = 0;
-unsigned long buzzerOffMs = 0;
-unsigned long buzzerPhaseStart = 0;
+int buzzerBeepsRemaining = 0;
+int buzzerOnMs = 0;
+int buzzerOffMs = 0;
+esp_timer_handle_t buzzerTimer = nullptr;
+SemaphoreHandle_t buzzerMutex = nullptr;
+
+void buzzerTimerCallback(void *arg) {
+  uint64_t nextDelayUs = 0;
+
+  xSemaphoreTake(buzzerMutex, portMAX_DELAY);
+  if (buzzerActive && buzzerPinOn) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerPinOn = false;
+    nextDelayUs = (uint64_t)buzzerOffMs * 1000;
+  } else if (buzzerActive) {
+    buzzerBeepsRemaining--;
+    if (buzzerBeepsRemaining <= 0) {
+      buzzerActive = false;
+    } else {
+      digitalWrite(BUZZER_PIN, HIGH);
+      buzzerPinOn = true;
+      nextDelayUs = (uint64_t)buzzerOnMs * 1000;
+    }
+  }
+
+  if (nextDelayUs > 0 && esp_timer_start_once(buzzerTimer, nextDelayUs) != ESP_OK) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerPinOn = false;
+    buzzerActive = false;
+  }
+  xSemaphoreGive(buzzerMutex);
+}
+
+bool initBuzzer() {
+  buzzerMutex = xSemaphoreCreateMutex();
+  if (buzzerMutex == nullptr) return false;
+
+  esp_timer_create_args_t timerArgs = {};
+  timerArgs.callback = &buzzerTimerCallback;
+  timerArgs.dispatch_method = ESP_TIMER_TASK;
+  timerArgs.name = "buzzer";
+  return esp_timer_create(&timerArgs, &buzzerTimer) == ESP_OK;
+}
 
 void queueBuzzer(int times, int beepDurationMs, int pauseDurationMs) {
-  if (times <= 0 || beepDurationMs <= 0 || pauseDurationMs < 0) return;
+  if (times <= 0 || beepDurationMs <= 0 || pauseDurationMs <= 0 ||
+      buzzerTimer == nullptr || buzzerMutex == nullptr) return;
+
+  xSemaphoreTake(buzzerMutex, portMAX_DELAY);
+  // The original blocking function could not overlap itself. Keep that
+  // single-pattern contract and avoid replacing a timer while its callback
+  // may be in flight.
+  if (buzzerActive) {
+    xSemaphoreGive(buzzerMutex);
+    return;
+  }
   buzzerOnMs = beepDurationMs;
   buzzerOffMs = pauseDurationMs;
   buzzerBeepsRemaining = times;
   buzzerPinOn = true;
-  buzzerPhaseStart = millis();
+  buzzerActive = true;
   digitalWrite(BUZZER_PIN, HIGH);
-}
-
-void serviceBuzzer() {
-  if (buzzerBeepsRemaining == 0) return;
-
-  unsigned long now = millis();
-  unsigned long phaseDuration = buzzerPinOn ? buzzerOnMs : buzzerOffMs;
-  if (now - buzzerPhaseStart < phaseDuration) return;
-
-  if (buzzerPinOn) {
+  if (esp_timer_start_once(buzzerTimer, (uint64_t)buzzerOnMs * 1000) != ESP_OK) {
     digitalWrite(BUZZER_PIN, LOW);
     buzzerPinOn = false;
-    buzzerPhaseStart = now;
-  } else {
-    buzzerBeepsRemaining--;
-    if (buzzerBeepsRemaining == 0) return;
-    digitalWrite(BUZZER_PIN, HIGH);
-    buzzerPinOn = true;
-    buzzerPhaseStart = now;
+    buzzerActive = false;
   }
+  xSemaphoreGive(buzzerMutex);
 }
 
 void waitForBuzzer() {
-  while (buzzerBeepsRemaining > 0) {
-    serviceBuzzer();
+  while (buzzerActive) {
     delay(1);
   }
 }
@@ -682,7 +710,7 @@ void steam(){
 
   if (input > steamSetpoint - 5 && !steaming){
     // Called every loop() iteration; must not block control timing, so this
-    // only queues the pattern. serviceBuzzer() in loop() advances it.
+    // only queues the pattern. The ESP timer service advances it.
     queueBuzzer(3,100,100);
     steaming = true;
   }
@@ -696,6 +724,10 @@ void setup() {
   delay(2000);
 
   pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  if (!initBuzzer()) {
+    Serial.println("Failed to initialize buzzer timer");
+  }
   
   //load config.json
   loadSDConfig();
@@ -743,8 +775,6 @@ void loop() {
   GetPressure();
   runPID();
   steam();
-  serviceBuzzer();
-
   // AC detection
   if (digitalRead(syncPin) == LOW && !acDetected && !PIDonly) {
     acDetectedTime = millis();
