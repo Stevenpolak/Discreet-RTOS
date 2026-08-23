@@ -125,6 +125,15 @@ From `#define`s in `Discreet.ino`:
 
 ## Safe boot outputs
 
+**This section describes the Phase 0 baseline (the unmodified imported
+firmware) specifically, not the current state of the codebase.** Phase 3
+(see [PHASE3_NOTES.md](PHASE3_NOTES.md)) centralized actuator writes behind
+`controlStep()`, which changed several of the specifics below — e.g. the
+SSR and dimmer are now written unconditionally every cycle from one place,
+not only from `runPID()`/the shot-phase branches as described here. Treat
+this section as a historical record of what was true at import, not a
+current-behaviour reference; check the latest `PHASE*_NOTES.md` for that.
+
 From source reading only (bench measurement not performed):
 
 - **Heater (`SSR_PIN`)**: `pinMode(SSR_PIN, OUTPUT)` runs in `setup()`, but
@@ -152,6 +161,12 @@ From source reading only (bench measurement not performed):
   the control boundary the sole actuator writer.
 
 ## Fault behaviour
+
+**Also the Phase 0 baseline specifically — see the note under "Safe boot
+outputs" above.** In particular, "pump behaviour is unaffected by \[an
+invalid temperature reading\]" below is no longer true as of Phase 3: a
+temperature fault now forces the pump off too, and aborts a shot in
+progress. See [PHASE3_NOTES.md](PHASE3_NOTES.md) §3.
 
 From source reading only:
 
