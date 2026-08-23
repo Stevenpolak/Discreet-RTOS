@@ -11,6 +11,13 @@
 #include <ESPmDNS.h>
 #include <esp_timer.h>
 
+// Forward declarations for functions called before their point of
+// definition later in this file. Arduino's automatic prototype generation
+// (ctags-based) does not reliably handle every C++ construct used below
+// (scoped enums, reference parameters, default member initializers), so
+// these are declared explicitly rather than relied on implicitly.
+int basePumpPowerForSetpoint(double Pumpsetpoint);
+String getContentType(String filename);
 
 // Wi-Fi Variables
 String ssid;
@@ -46,16 +53,15 @@ WebServer server(80);
 MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 
 // PID Setup
-double setpoint, input, output,setpointBoot;
+double setpoint, input, output;
 double Kp = 48.0, Ki = 8, Kd = 50.0;
 
 PID myPID(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 //Pressure Variables
-int pressuresetpoint = 9;
-int PrePressureSetpoint = 3;
-int PressureTarget = pressuresetpoint;
-int pumppower = 0; 
+int PrePressureSetpoint = 3; // Fixed pre-infusion pressure target; not currently user-editable.
+int PressureTarget = 9;      // Overwritten before use once a shot is in progress; matches the old default pressuresetpoint value.
+int pumppower = 0;
 int maxPressure = 12;
 double currentPressure = 0;
 
@@ -103,7 +109,6 @@ double steamSetpoint;
 
 //Other Variables
 int offset = 9; // Due to probe location. If you ask for 100 you will get 91, tune this variable.
-int preinftime = 8;
 
 bool acDetected = false;
 bool PIDonly = false;
@@ -111,7 +116,6 @@ bool shotStarted = false;
 bool pumpPowerSetPreinf = false;
 bool pumpPowerSetExtraction = false;
 
-int bloomtime = 0;
 // AC-off debounce state. acOffPending is true once syncPin has been observed
 // HIGH (off) at least once since it was last LOW (on); acOffSince is the
 // millis() timestamp of that first HIGH sample; acOffSamples counts how many
@@ -120,6 +124,205 @@ int bloomtime = 0;
 bool acOffPending = false;
 unsigned long acOffSince = 0;
 int acOffSamples = 0;
+
+// --- Explicit state and data models (Phase 2) -------------------------------
+// See docs/PHASE2_NOTES.md for design rationale and scope decisions. These
+// are value-only types; no FreeRTOS task, queue, or actuator-ownership
+// change happens in this phase - everything below still runs synchronously
+// inside the single Arduino loop().
+
+enum class OperatingMode : uint8_t { NORMAL, TEMP_ONLY };
+enum class ShotState : uint8_t { IDLE, PREINFUSION, BLOOM, EXTRACTION, COMPLETE, FAULT };
+enum class FaultCode : uint8_t { NONE, INVALID_TEMPERATURE };
+
+const char* toString(OperatingMode mode) {
+  switch (mode) {
+    case OperatingMode::TEMP_ONLY: return "TEMP_ONLY";
+    default: return "NORMAL";
+  }
+}
+
+const char* toString(ShotState state) {
+  switch (state) {
+    case ShotState::PREINFUSION: return "PREINFUSION";
+    case ShotState::BLOOM: return "BLOOM";
+    case ShotState::EXTRACTION: return "EXTRACTION";
+    case ShotState::COMPLETE: return "COMPLETE";
+    case ShotState::FAULT: return "FAULT";
+    default: return "IDLE";
+  }
+}
+
+const char* toString(FaultCode code) {
+  switch (code) {
+    case FaultCode::INVALID_TEMPERATURE: return "INVALID_TEMPERATURE";
+    default: return "NONE";
+  }
+}
+
+OperatingMode currentMode = OperatingMode::NORMAL;
+ShotState currentShotState = ShotState::IDLE;
+FaultCode currentFault = FaultCode::NONE;
+
+// Latched, per-shot control settings. REWRITE_PLAN.md's "Settings lifecycle"
+// specifically calls out brew temperature, pressure [target] and phase
+// durations as unable to alter a shot already in progress - those four
+// fields live here. Kp/Ki/Kd, offset, steamSetpoint and PIDonly are not
+// called out there and stay as plain, immediately-applied globals,
+// unchanged from Phase 1.
+struct ControlSettings {
+  double setpoint = 0;         // brew target temperature; same offset-adjusted internal representation the old `setpoint` global used
+  int preinftime = 8;          // seconds, 0..20
+  int bloomtime = 0;           // seconds, 0..20
+  int pressuresetpoint = 9;    // bar, 3..13
+  unsigned long revision = 0;  // bumped on every accepted edit
+};
+
+ControlSettings activeSettings;   // in effect whenever no shot is in progress; source for the next shot's latch
+ControlSettings shotSettings;     // latched from activeSettings at shot start; read-only for the duration of the shot
+ControlSettings pendingSettings;  // latest edit; promoted to activeSettings when the shot returns to IDLE
+
+// Value-only description of a validated /adjust or /saveConfig request. Not
+// yet routed through a cross-task queue (that's Phase 4) - applyControlCommand()
+// still runs synchronously inside the HTTP handler, in the same execution
+// context as everything else in loop(). Defining the shape now means later
+// phases can route requests through it without a second redefinition.
+struct ControlCommand {
+  enum class Type : uint8_t {
+    NONE,
+    SET_BREW_SETPOINT,
+    SET_PREINFTIME,
+    SET_BLOOMTIME,
+    SET_PRESSURESETPOINT,
+    START_STEAM,
+    STOP_STEAM,
+  } type = Type::NONE;
+  int delta = 0;  // relative adjustment, matches /adjust's existing "val" semantics
+};
+
+// Complete, copyable snapshot of everything the service side might want to
+// show or log. Not yet published through a length-1 overwrite queue (that
+// needs a second task - Phase 4/5); handleGetValues() builds one
+// synchronously today.
+struct TelemetrySnapshot {
+  OperatingMode mode;
+  ShotState shotState;
+  FaultCode fault;
+  double temperature;  // offset-corrected, deg C
+  double pressure;      // bar
+  int pumpPower;
+  unsigned long elapsedShotTimeMs;
+  unsigned long activeSettingsRevision;
+  unsigned long shotSettingsRevision;
+  unsigned long pendingSettingsRevision;
+  unsigned long timestampMs;
+};
+
+TelemetrySnapshot buildTelemetrySnapshot() {
+  TelemetrySnapshot snap;
+  snap.mode = currentMode;
+  snap.shotState = currentShotState;
+  snap.fault = currentFault;
+  snap.temperature = input - offset;
+  snap.pressure = currentPressure;
+  snap.pumpPower = pumppower;
+  snap.elapsedShotTimeMs = acDetected ? elapsedTime : 0;
+  snap.activeSettingsRevision = activeSettings.revision;
+  snap.shotSettingsRevision = shotSettings.revision;
+  snap.pendingSettingsRevision = pendingSettings.revision;
+  snap.timestampMs = millis();
+  return snap;
+}
+
+// Accepts an edit to one of the three latched int fields. While idle it
+// takes effect immediately (there is no in-progress shot to protect);
+// mid-shot it only updates pendingSettings and is promoted to
+// activeSettings when the shot returns to IDLE (see loop()'s shot-end
+// handling below).
+void acceptPreinftimeEdit(int newValue) {
+  pendingSettings.preinftime = newValue;
+  pendingSettings.revision++;
+  if (currentShotState == ShotState::IDLE) {
+    activeSettings.preinftime = newValue;
+    activeSettings.revision = pendingSettings.revision;
+  }
+}
+
+void acceptBloomtimeEdit(int newValue) {
+  pendingSettings.bloomtime = newValue;
+  pendingSettings.revision++;
+  if (currentShotState == ShotState::IDLE) {
+    activeSettings.bloomtime = newValue;
+    activeSettings.revision = pendingSettings.revision;
+  }
+}
+
+void acceptPressuresetpointEdit(int newValue) {
+  pendingSettings.pressuresetpoint = newValue;
+  pendingSettings.revision++;
+  if (currentShotState == ShotState::IDLE) {
+    activeSettings.pressuresetpoint = newValue;
+    activeSettings.revision = pendingSettings.revision;
+  }
+}
+
+// setpoint feeds myPID via a bound pointer (PID_v1 takes one at
+// construction), so it can't be replaced by a struct field directly; it
+// stays live-updated at the points where the effective value can change.
+// steam()/handleAdjust()'s "steam" override always takes precedence,
+// unchanged from before Phase 2.
+void acceptBrewSetpointEdit(double newValue) {
+  pendingSettings.setpoint = newValue;
+  pendingSettings.revision++;
+  if (currentShotState == ShotState::IDLE) {
+    activeSettings.setpoint = newValue;
+    activeSettings.revision = pendingSettings.revision;
+    if (!steaming) setpoint = newValue;
+  }
+}
+
+// Validates and applies one ControlCommand. Mirrors the constrain() ranges
+// the original handleAdjust() enforced, and the pumppower side-effects it
+// had on preinftime/pressuresetpoint edits (a pre-existing quirk, preserved
+// rather than "fixed" here). Returns false for an unrecognized command,
+// matching the old handler's silent-no-op-then-200 behaviour for unknown
+// "var" values.
+bool applyControlCommand(const ControlCommand& cmd) {
+  bool idle = (currentShotState == ShotState::IDLE);
+  switch (cmd.type) {
+    case ControlCommand::Type::SET_PREINFTIME: {
+      int base = idle ? activeSettings.preinftime : pendingSettings.preinftime;
+      acceptPreinftimeEdit(constrain(base + cmd.delta, 0, 20));
+      pumppower = basePumpPowerForSetpoint(PrePressureSetpoint);
+      return true;
+    }
+    case ControlCommand::Type::SET_BLOOMTIME: {
+      int base = idle ? activeSettings.bloomtime : pendingSettings.bloomtime;
+      acceptBloomtimeEdit(constrain(base + cmd.delta, 0, 20));
+      return true;
+    }
+    case ControlCommand::Type::SET_BREW_SETPOINT: {
+      double base = idle ? activeSettings.setpoint : pendingSettings.setpoint;
+      acceptBrewSetpointEdit(constrain(base + cmd.delta, 10 + offset, 96 + offset));
+      return true;
+    }
+    case ControlCommand::Type::SET_PRESSURESETPOINT: {
+      int base = idle ? activeSettings.pressuresetpoint : pendingSettings.pressuresetpoint;
+      int newValue = constrain(base + cmd.delta, 3, 13);
+      acceptPressuresetpointEdit(newValue);
+      pumppower = basePumpPowerForSetpoint(newValue);
+      return true;
+    }
+    case ControlCommand::Type::START_STEAM:
+      setpoint = steamSetpoint;
+      return true;
+    case ControlCommand::Type::STOP_STEAM:
+      setpoint = activeSettings.setpoint;
+      return true;
+    default:
+      return false;
+  }
+}
 
 DimmableLight light(thyristorPin);
 
@@ -354,33 +557,23 @@ void handleAdjust() {
   String var = server.arg("var");
   int val = server.arg("val").toInt();
 
-  if (var == "preinftime") {
-    preinftime = constrain(preinftime + val, 0, 20);
-    pumppower = basePumpPowerForSetpoint(PrePressureSetpoint);
-  }  
-  else if (var == "bloomtime") {
-    bloomtime = constrain(bloomtime + val, 0, 20);
-  }
-  else if (var == "Pause") {
-    light.setBrightness(0);
-  }
-  else if (var == "Resume") {
-    light.setBrightness(pumppower);
-  }
-  else if (var == "setpoint") {
-    setpoint = constrain(setpoint + val, 10 + offset, 96 + offset);
-    setpointBoot = setpoint;
-  }
-  else if (var == "steam") {
-    setpoint = steamSetpoint;
-  }
-    else if (var == "stopsteam") {
-    setpoint = setpointBoot;
-  }
-  else if (var == "pressuresetpoint") {
-    pressuresetpoint = constrain(pressuresetpoint + val, 3, 13);
-    pumppower = basePumpPowerForSetpoint(pressuresetpoint);
-  }
+  // "Pause" and "Resume" intentionally removed here (Phase 2, see
+  // docs/PHASE2_NOTES.md and docs/REWRITE_PLAN.md "Operating model" -
+  // there is no PAUSED shot state and no ambiguous question about whether
+  // shot time should freeze). An unrecognized var, including a leftover
+  // "Pause"/"Resume" request from an old client, falls through to
+  // ControlCommand::Type::NONE and is a no-op, matching the old handler's
+  // behaviour for any other unknown var.
+  ControlCommand cmd;
+  if (var == "preinftime") cmd.type = ControlCommand::Type::SET_PREINFTIME;
+  else if (var == "bloomtime") cmd.type = ControlCommand::Type::SET_BLOOMTIME;
+  else if (var == "setpoint") cmd.type = ControlCommand::Type::SET_BREW_SETPOINT;
+  else if (var == "steam") cmd.type = ControlCommand::Type::START_STEAM;
+  else if (var == "stopsteam") cmd.type = ControlCommand::Type::STOP_STEAM;
+  else if (var == "pressuresetpoint") cmd.type = ControlCommand::Type::SET_PRESSURESETPOINT;
+  cmd.delta = val;
+
+  applyControlCommand(cmd);
   server.send(200, "text/plain", "OK");
 }
 
@@ -398,21 +591,39 @@ void handleTemp() {
 }
 
 void handleGetValues() {
-  
-  StaticJsonDocument<256> doc;
-  doc["setpoint"] = int(setpoint - offset);
-  doc["preinftime"] = preinftime;
-  doc["bloomtime"] = bloomtime;
-  doc["pressure"] = currentPressure;
-  doc["pumppower"] = pumppower;
-  doc["pressuresetpoint"] = int(pressuresetpoint);
+
+  // preinftime/bloomtime/pressuresetpoint/setpoint are read from
+  // pendingSettings, not activeSettings or shotSettings: the front end's
+  // updateLabels() calls this right after posting an /adjust edit and
+  // expects to see that edit reflected immediately, whether idle or
+  // mid-shot. While idle, pendingSettings == activeSettings, so this is
+  // unchanged from Phase 1 in the common case.
+  TelemetrySnapshot snap = buildTelemetrySnapshot();
+
+  StaticJsonDocument<384> doc;
+  doc["setpoint"] = int(pendingSettings.setpoint - offset);
+  doc["preinftime"] = pendingSettings.preinftime;
+  doc["bloomtime"] = pendingSettings.bloomtime;
+  doc["pressure"] = snap.pressure;
+  doc["pumppower"] = snap.pumpPower;
+  doc["pressuresetpoint"] = pendingSettings.pressuresetpoint;
   doc["actime"] = actime;
-  doc["temp"] = input - offset;
+  doc["temp"] = snap.temperature;
   doc["Kp"] = Kp;
   doc["Ki"] = Ki;
   doc["Kd"] = Kd;
   doc["brewTemp"] = brewTemp;
   doc["steamSetpoint"] = steamSetpoint;
+
+  // New in Phase 2: explicit mode/state/fault and settings-revision fields.
+  // Additive - all fields above are unchanged from Phase 1.
+  doc["mode"] = toString(snap.mode);
+  doc["shotState"] = toString(snap.shotState);
+  doc["fault"] = toString(snap.fault);
+  doc["activeSettingsRevision"] = snap.activeSettingsRevision;
+  doc["shotSettingsRevision"] = snap.shotSettingsRevision;
+  doc["pendingSettingsRevision"] = snap.pendingSettingsRevision;
+  doc["snapshotTimestampMs"] = snap.timestampMs;
 
   // Use a buffer to generate the JSON, then send it
   String response;
@@ -453,11 +664,13 @@ void runPID() {
     lastPIDTime = PIDnow;
     
     input = thermocouple.readCelsius();
-  
+
     if (isnan(input) || input < 0 || input > 160) {
+      currentFault = FaultCode::INVALID_TEMPERATURE;
       digitalWrite(SSR_PIN, LOW); // SSR Off
       return; // Exit function, SSR stays off
     }
+    currentFault = FaultCode::NONE;
 
     myPID.Compute();
 
@@ -601,9 +814,15 @@ void setupServerRoutes() {
     myPID.SetTunings(Kp, Ki, Kd); 
 
     offset = doc["offset"] | offset;
-    setpoint = (doc["setpoint"] | setpoint) + offset;
+    // Routed through the settings-lifecycle accept path (Phase 2) rather
+    // than assigned directly: while idle this takes effect immediately,
+    // matching the old behaviour; if a shot happens to be in progress it
+    // becomes pending instead of altering that shot, same as an /adjust
+    // "setpoint" edit.
+    acceptBrewSetpointEdit((doc["setpoint"] | setpoint) + offset);
     steamSetpoint = (doc["steamSetpoint"] | steamSetpoint) + offset;
     PIDonly = doc["PIDonly"] | PIDonly;
+    currentMode = PIDonly ? OperatingMode::TEMP_ONLY : OperatingMode::NORMAL;
 
     Serial.println("Config saved");
   
@@ -658,20 +877,33 @@ void loadSDConfig() {
     steamSetpoint = doc["steamSetpoint"] | steamSetpoint;
     PIDonly = doc["PIDonly"] | PIDonly;
 
-    setpoint = setpoint + offset;
-    setpointBoot = setpoint;
-    steamSetpoint = steamSetpoint + offset;
-
   } else {
     Kp = 80;
     Ki = 6;
     Kd = 55;
     setpoint = 93;
     offset = 9;
-    setpointBoot = setpoint + offset;
-    steamSetpoint = 140 + offset;
-  } 
-  
+    steamSetpoint = 140;
+  }
+
+  // Both branches above leave setpoint/steamSetpoint as the raw
+  // (un-offset) value; add offset once, uniformly. The old code added
+  // offset to setpoint only in the if-branch, leaving setpoint and the
+  // since-removed setpointBoot 'offset' apart in the else-branch (a
+  // pre-existing bug, only reachable when config.json is missing/unreadable
+  // and steam mode is used) - fixed as a direct consequence of retiring
+  // setpointBoot in favour of activeSettings.setpoint below, since the two
+  // could no longer be allowed to disagree.
+  setpoint = setpoint + offset;
+  steamSetpoint = steamSetpoint + offset;
+
+  currentMode = PIDonly ? OperatingMode::TEMP_ONLY : OperatingMode::NORMAL;
+
+  activeSettings.setpoint = setpoint;
+  activeSettings.revision = 1;
+  pendingSettings = activeSettings;
+  shotSettings = activeSettings;
+
   //end SD and SPI
   SD.end();
   SPI.end();  // fully kill SPI
@@ -784,10 +1016,16 @@ void loop() {
 
   if (acDetected) {
 
-    // Run once at shot start
+    // Run once at shot start: entry actions for the IDLE -> PREINFUSION
+    // transition. Latches this shot's settings so mid-shot edits (which
+    // now land in pendingSettings - see acceptPreinftimeEdit() etc. above)
+    // cannot alter the shot already in progress
+    // (docs/REWRITE_PLAN.md "Settings lifecycle").
     if (!shotStarted) {
       shotStarted = true;
-      preinftime = (bloomtime > 0 && preinftime < 5) ? 8 : preinftime;
+      shotSettings = activeSettings;
+      shotSettings.preinftime = (shotSettings.bloomtime > 0 && shotSettings.preinftime < 5) ? 8 : shotSettings.preinftime;
+      if (!steaming) setpoint = shotSettings.setpoint;
     }
 
     // Calculate shot time
@@ -795,11 +1033,12 @@ void loop() {
     actime = elapsedTime / 1000;
 
     // --- PRE-INFUSION ---
-    if (preinftime > 0 && actime < preinftime) {
+    if (shotSettings.preinftime > 0 && actime < shotSettings.preinftime) {
+      currentShotState = ShotState::PREINFUSION;
       if (currentPressure <= PrePressureSetpoint - 1) {
         pumppower = 255;
-        light.setBrightness(pumppower); 
-        pumpPowerSetPreinf = false;     
+        light.setBrightness(pumppower);
+        pumpPowerSetPreinf = false;
       }
       else if (!pumpPowerSetPreinf) {
          PressureTarget = PrePressureSetpoint;
@@ -812,20 +1051,22 @@ void loop() {
     }
 
     // --- BLOOM ---
-    else if (bloomtime > 0 && actime < preinftime + bloomtime) {
+    else if (shotSettings.bloomtime > 0 && actime < shotSettings.preinftime + shotSettings.bloomtime) {
+      currentShotState = ShotState::BLOOM;
       pumppower = 0;
       light.setBrightness(pumppower);
     }
 
     // --- EXTRACTION ---
     else {
-      if (currentPressure < pressuresetpoint - 2) {
+      currentShotState = ShotState::EXTRACTION;
+      if (currentPressure < shotSettings.pressuresetpoint - 2) {
         pumppower = 255;
         light.setBrightness(pumppower);
         pumpPowerSetExtraction = false;
       }
       else if (!pumpPowerSetExtraction) {
-         PressureTarget = pressuresetpoint;
+         PressureTarget = shotSettings.pressuresetpoint;
          pumppower = basePumpPowerForSetpoint(PressureTarget); // runs once
          light.setBrightness(pumppower);
          pumpPowerSetExtraction = true;  // prevents it running again
@@ -864,6 +1105,27 @@ void loop() {
       light.setBrightness(0);
       acOffPending = false;
       acOffSamples = 0;
+
+      // Shot-end entry actions: promote the latest pending settings
+      // (docs/REWRITE_PLAN.md "atomically promote the latest pending
+      // revision to activeSettings") and report COMPLETE for this
+      // iteration; the next iteration's `else` branch below reports IDLE.
+      currentShotState = ShotState::COMPLETE;
+      activeSettings = pendingSettings;
+      if (!steaming) setpoint = activeSettings.setpoint;
     }
+  } else {
+    currentShotState = ShotState::IDLE;
+  }
+
+  // FAULT has priority over the phase label above, in any state
+  // (docs/REWRITE_PLAN.md "FAULT may be entered from any state"). This is
+  // telemetry/observability only in Phase 2 - none of the pump-control
+  // branches above are gated on fault status, so actuator behaviour is
+  // unchanged from Phase 1. Making FAULT actually override actuator
+  // outputs is Phase 3's job ("Apply output priority: fault/safety off,
+  // mode restrictions, state-machine demand, controller output").
+  if (currentFault != FaultCode::NONE) {
+    currentShotState = ShotState::FAULT;
   }
 }
