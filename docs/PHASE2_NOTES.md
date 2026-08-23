@@ -11,6 +11,20 @@ This PR does not create a FreeRTOS task, a queue, or a single
 `controlStep()` boundary — those are Phases 3-5. Everything here still runs
 synchronously inside the single Arduino `loop()` and its HTTP handlers.
 
+**This PR went through an independent review round before being proposed
+for merge; see "Review round 1: findings and fixes" below.** The first
+version had a real bug at the center of the whole settings-lifecycle
+mechanism: the "is it safe to apply this edit immediately" check used
+`currentShotState == ShotState::IDLE` — a telemetry label — instead of the
+actual underlying signal, which broke the "idle edits apply immediately"
+guarantee whenever a fault was active or in a narrow one-iteration window
+after every shot. It also left the pump-power side-effect on
+preinftime/pressuresetpoint edits unguarded, so a mid-shot edit could still
+visibly perturb the running shot even though the setting itself was
+correctly latched — undermining this PR's central promise. Both are fixed
+below, along with a steam-request-cancellation bug the new setpoint-mirror
+code introduced.
+
 ## What changed
 
 ### 1. `OperatingMode`, `ShotState`, `FaultCode`
@@ -58,6 +72,17 @@ that here, ahead of schedule and without hardware to verify the interaction
 of a temperature fault with an in-progress shot's pump behaviour, would be
 exactly the kind of change this project's own safety framing warns against.
 Recorded as a known, deliberate scope boundary, not an oversight.
+
+**Correction from Review round 1:** the claim above ("does not touch
+actuator outputs") is true, but the first version of this PR's *reporting*
+mechanism was not actually observability-only — because the settings
+lifecycle's idle/mid-shot gate incorrectly read `currentShotState` instead
+of `acDetected` (see "Review round 1" finding 1 below), `FAULT` overriding
+that label had a real side effect: it froze every settings edit while
+active, even with no shot running. Fixed by switching the settings gate to
+`!acDetected`, which restores the intended separation — `currentShotState`
+is purely a label again, and `FAULT` genuinely cannot affect anything
+except what `/getValues` reports.
 
 ### 3. Pause/Resume removed
 
@@ -109,11 +134,12 @@ being the other), not just a structural relabeling - `REWRITE_PLAN.md`
 explicitly scopes it to Phase 2 ("Define the atomic `pendingSettings ->
 activeSettings` promotion on return to `IDLE`").
 
-- **While idle** (`currentShotState == ShotState::IDLE`), an accepted edit
-  updates `activeSettings` immediately (and `pendingSettings` in lockstep,
-  so they never disagree while idle) - there's no in-progress shot to
-  protect, and the UI expects to see its own edit reflected right away
-  (see the `updateLabels()` note below).
+- **While idle** (`!acDetected` — **not** `currentShotState ==
+  ShotState::IDLE`; see "Review round 1" below for why that distinction
+  matters), an accepted edit updates `activeSettings` immediately (and
+  `pendingSettings` in lockstep, so they never disagree while idle) -
+  there's no in-progress shot to protect, and the UI expects to see its own
+  edit reflected right away (see the `updateLabels()` note below).
 - **Mid-shot**, an accepted edit updates only `pendingSettings`;
   `shotSettings` (latched from `activeSettings` at shot start) and the
   running shot are unaffected.
@@ -135,10 +161,11 @@ pointer to `setpoint` (`PID myPID(&input, &output, &setpoint, ...)`), so it
 can't be redirected to a struct field. `setpoint` stays as the one global
 PID reads, but it is now only ever written at the specific points the
 settings-lifecycle state machine changes what's "current": shot start,
-shot end, an idle-time edit, and `steam`/`stopsteam`. `steaming`'s own
-override (set by the automatic `steam()` threshold check) still takes
-unconditional precedence at every one of those points, unchanged from
-before.
+shot end, an idle-time edit, and `steam`/`stopsteam`. These writes are
+guarded by `steamRequested` (a dedicated flag, set/cleared by `steam`/
+`stopsteam`), not by `steaming` — see "Review round 1" below; the first
+version used `steaming`, which is a temperature-threshold hysteresis flag
+unrelated to whether a steam request is actually in effect.
 
 **`setpointBoot` retired:** the old code kept `setpointBoot` in sync with
 every `setpoint` edit specifically so `stopsteam` could restore "the last
@@ -168,6 +195,111 @@ see that edit reflected right away, whether idle or mid-shot - reading
 idle, `pendingSettings == activeSettings`, so this is unchanged from Phase
 1 in the common case; only mid-shot does it now show the pending edit
 rather than a value that used to be mutated live with no latch at all.
+
+**Exception: `setpoint`.** While `steamRequested`, the live PID target is
+`steamSetpoint`, which has no relationship to `pendingSettings.setpoint`
+(the brew target) at all. `doc["setpoint"]` reports the live `setpoint`
+global in that case instead, matching `/temp` and restoring the pre-Phase-2
+behaviour of the two endpoints agreeing during steam - see "Review round 1"
+below.
+
+## Review round 1: findings and fixes
+
+Before being proposed for merge, this PR was reviewed by an independent
+model (Opus) across 7 angles (correctness scan, removed-behaviour audit,
+cross-file trace, reuse, simplification, efficiency, altitude) with a
+verification pass on every candidate, following the same process as the
+Phase 0+1 PR. The findings that changed the code, in order of severity:
+
+1. **(fixed, root cause of most of the below)** The idle/mid-shot gate in
+   all four `accept*Edit()` functions and `applyControlCommand()` tested
+   `currentShotState == ShotState::IDLE`. `currentShotState` is a telemetry
+   label, not the actual "is a shot in progress" signal: the FAULT
+   override at the end of `loop()` sets it to `FAULT` unconditionally
+   whenever `currentFault != NONE`, *including while genuinely idle*, and
+   it holds `COMPLETE` for one iteration past shot-end into the following
+   iteration's `server.handleClient()` call (which runs before the `else`
+   branch reassigns `IDLE`). Both meant edits could be wrongly treated as
+   mid-shot: a fault would freeze every settings edit indefinitely (no
+   shot required to clear it - the edit just never reaches
+   `activeSettings`), and an edit landing in the one-iteration `COMPLETE`
+   window would be deferred an entire extra shot cycle even though the
+   shot it was supposedly protecting had already ended and already been
+   promoted. Fixed by testing `!acDetected` instead everywhere - the
+   actual boolean the shot-phase logic itself is gated on, which is
+   cleared synchronously at shot-end (before promotion runs) and is never
+   touched by fault handling.
+2. **(fixed)** `applyControlCommand()`'s pumppower side-effect on
+   `preinftime`/`pressuresetpoint` edits (a pre-existing quirk from the
+   original `handleAdjust()`, described in the first version of this PR as
+   "preserved rather than fixed") wrote the live `pumppower` global
+   unconditionally, with no idle check at all. This directly undermined
+   the PR's central guarantee: a mid-shot `pressuresetpoint` edit correctly
+   left `shotSettings.pressuresetpoint` (and therefore `PressureTarget`)
+   frozen, but still immediately jumped `pumppower` toward the new,
+   unapplied target - a real, unrequested pressure transient during a shot
+   the documentation claimed was unalterable. Fixed by gating both
+   side-effects on the same (now-correct) `idle` check.
+3. **(fixed)** The three `setpoint`-mirror writes this PR added (accepting
+   an idle brew-setpoint edit, shot start, shot end) were guarded by
+   `steaming` - a temperature-threshold hysteresis flag `steam()` sets only
+   once the boiler actually reaches `steamSetpoint - 5`, not a "steam is
+   currently requested" flag. `START_STEAM`/`STOP_STEAM` never touched
+   `steaming`, so any of these three writes firing during the ~30-40s
+   warm-up ramp (while `steaming` was still false) would silently revert
+   `setpoint` back to the brew target, cancelling the steam request with no
+   UI indication. Fixed by adding a dedicated `steamRequested` flag, set by
+   `START_STEAM` and cleared by `STOP_STEAM`, and guarding all three writes
+   on that instead. `steaming` itself is untouched and still drives only
+   the steam-ready beep, exactly as before this PR.
+4. **(fixed)** As a direct consequence of finding 1, `handleGetValues()`'s
+   `setpoint` field (switched to `pendingSettings.setpoint` in the first
+   version of this PR) stopped tracking the steam target during steaming,
+   since `START_STEAM` writes only the live `setpoint` global, never
+   `pendingSettings`. `/temp` (unchanged) still reported the steam target
+   correctly, so the two endpoints disagreed, and the front-end chart/label
+   (`scripts.js`) flat-lined at the brew temperature while the machine
+   actually climbed to steam temperature. Fixed: `/getValues` now reports
+   the live `setpoint` while `steamRequested`, and `pendingSettings.setpoint`
+   otherwise.
+5. **(fixed, lower confidence/severity)** `/saveConfig`'s fallback for a
+   POST body that omits `"setpoint"` read the live `setpoint` global as
+   `doc["setpoint"] | setpoint` - which holds `steamSetpoint` while
+   `steamRequested`, and would have been persisted into
+   `activeSettings`/`pendingSettings` as the new canonical brew target.
+   Fixed by using `pendingSettings.setpoint` (offset-corrected) as the
+   fallback instead, which is never contaminated by a steam override. Note:
+   `/saveConfig`'s setpoint write still has no `constrain()` clamp (unlike
+   `/adjust`'s `SET_BREW_SETPOINT`) and can still double-count `offset` if
+   the client omits both `"offset"` and `"setpoint"` in the same request -
+   both pre-existing in the original baseline, not introduced by this PR,
+   and left as-is rather than expanding this fix's scope.
+6. **(not fixed, architectural note for later phases)** `ControlCommand`
+   carries a relative `int delta`, matching `/adjust`'s existing "val"
+   semantics - but `REWRITE_PLAN.md`'s Phase 4 explicitly requires
+   coalescing repeated edits so "the latest complete pending revision
+   wins," which is only possible with an absolute value in the command. A
+   relative delta can't be coalesced (two dropped `+1`s change the final
+   target silently) and depends on reading `activeSettings`/
+   `pendingSettings` to compute its base, which won't be reachable from the
+   web-handler side once a real queue exists. This PR's claim that defining
+   `ControlCommand` now avoids a second redefinition later doesn't hold for
+   the field that actually carries the edit; flagged for Phase 3/4 to
+   reconsider rather than changed here.
+7. **(not fixed, hygiene note)** `StaticJsonDocument<N>` is a deprecated
+   compatibility shim under the installed ArduinoJson 7.4.3 - `N` is not
+   used to reserve a static buffer (the type is heap/pool-backed in v7), so
+   this PR's 256→384 size bump has no actual effect. Not fixed here since
+   the pattern is used throughout the whole file, predating this PR: fixing
+   it properly means auditing every `StaticJsonDocument` call site, which
+   is out of scope for a targeted bug-fix round.
+
+Also found and dismissed as not worth fixing in this round: several
+cleanup opportunities (the four `accept*Edit()` functions could collapse
+into one parameterized helper; `pendingSettings`/`activeSettings` staying
+in lockstep while idle means some of the idle-branch code is redundant).
+Real, but purely structural — deferred rather than risking further churn
+in the same review cycle that just fixed five behavioural bugs.
 
 ## What was intentionally *not* done in this phase
 
@@ -199,14 +331,15 @@ auto-prototyping will handle it.
 
 ## Build verification
 
-Compiled with the same toolchain as Phase 0/1 (`esp32:esp32@2.0.17`):
+Compiled with the same toolchain as Phase 0/1 (`esp32:esp32@2.0.17`), after
+the review-round fixes:
 
 ```
-Sketch uses 905149 bytes (69%) of program storage space. Maximum is 1310720 bytes.
+Sketch uses 905289 bytes (69%) of program storage space. Maximum is 1310720 bytes.
 Global variables use 51260 bytes (15%) of dynamic memory, leaving 276420 bytes for local variables. Maximum is 327680 bytes.
 ```
 
-No compiler errors or warnings. +1516 bytes flash / +48 bytes RAM versus
+No compiler errors or warnings. +1656 bytes flash / +48 bytes RAM versus
 the merged Phase 0+1 state (`v2.0.0-alpha`: 903,633 bytes flash, 51,212
 bytes RAM).
 
@@ -219,6 +352,17 @@ bytes RAM).
 - [x] AC-off debounce and buzzer sequencer (Phase 1) untouched.
 - [x] `runPID()`'s SSR safety behaviour unchanged; only a `currentFault`
       assignment was added alongside the existing check.
+- [x] The settings-lifecycle idle/mid-shot gate correctly tracks whether a
+      shot is actually running (`!acDetected`), independent of fault status
+      or telemetry-label timing (Review round 1, finding 1).
+- [x] Mid-shot settings edits genuinely cannot perturb the running shot,
+      including the pump-power side-effect that the first version of this
+      PR left unguarded (Review round 1, finding 2).
+- [x] A steam request cannot be silently cancelled by an unrelated edit,
+      shot start, or shot end during the warm-up ramp (Review round 1,
+      finding 3).
+- [x] `/getValues` and `/temp` agree on `setpoint` during steaming (Review
+      round 1, finding 4).
 - [ ] **Intentional behaviour change:** mid-shot settings edits no longer
       take effect until the shot returns to `IDLE` (§5 above) - this is
       what Phase 2 was scoped to introduce.
@@ -227,6 +371,7 @@ bytes RAM).
 - [ ] Bench re-test still required, same hardware limitation as Phase 0/1
       (`BASELINE.md`). This phase adds new items to verify: mid-shot
       setting edits genuinely don't affect the running shot and correctly
-      apply to the next one; `/getValues`' new fields read sensibly;
+      apply to the next one; a steam request survives being idle/pulling a
+      shot during warm-up; `/getValues`' new fields read sensibly;
       `Pause`/`Resume` requests from an old client no longer do anything
       (harmless no-op, not an error).

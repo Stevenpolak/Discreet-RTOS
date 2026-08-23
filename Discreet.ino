@@ -104,7 +104,8 @@ int actime = 0;  // Shot time in seconds
 
 //Steam Veriables
 String brewTemp;
-bool steaming = false;
+bool steaming = false;       // temperature-threshold hysteresis flag (steam() sets it once input reaches steamSetpoint-5); drives the steam-ready beep, not the setpoint mirror.
+bool steamRequested = false; // set by the "steam"/"stopsteam" /adjust commands (Phase 2); the setpoint-mirror guard - see acceptBrewSetpointEdit().
 double steamSetpoint;
 
 //Other Variables
@@ -239,10 +240,22 @@ TelemetrySnapshot buildTelemetrySnapshot() {
 // mid-shot it only updates pendingSettings and is promoted to
 // activeSettings when the shot returns to IDLE (see loop()'s shot-end
 // handling below).
+//
+// "Idle" here is `!acDetected`, not `currentShotState == ShotState::IDLE`.
+// currentShotState is a telemetry label, not a control input: the FAULT
+// override at the end of loop() sets it to FAULT even while genuinely idle
+// (freezing every edit for as long as a fault is latched, with no shot
+// required to clear it), and it holds COMPLETE for one iteration after
+// shot-end into the next iteration's server.handleClient() (line ~1006),
+// before the `else` branch reassigns IDLE - a request serviced in that
+// window would otherwise be treated as mid-shot even though the shot has
+// already ended and its settings already promoted. acDetected does not
+// have either problem: it is cleared synchronously at shot-end (before
+// promotion runs) and is never touched by fault handling.
 void acceptPreinftimeEdit(int newValue) {
   pendingSettings.preinftime = newValue;
   pendingSettings.revision++;
-  if (currentShotState == ShotState::IDLE) {
+  if (!acDetected) {
     activeSettings.preinftime = newValue;
     activeSettings.revision = pendingSettings.revision;
   }
@@ -251,7 +264,7 @@ void acceptPreinftimeEdit(int newValue) {
 void acceptBloomtimeEdit(int newValue) {
   pendingSettings.bloomtime = newValue;
   pendingSettings.revision++;
-  if (currentShotState == ShotState::IDLE) {
+  if (!acDetected) {
     activeSettings.bloomtime = newValue;
     activeSettings.revision = pendingSettings.revision;
   }
@@ -260,7 +273,7 @@ void acceptBloomtimeEdit(int newValue) {
 void acceptPressuresetpointEdit(int newValue) {
   pendingSettings.pressuresetpoint = newValue;
   pendingSettings.revision++;
-  if (currentShotState == ShotState::IDLE) {
+  if (!acDetected) {
     activeSettings.pressuresetpoint = newValue;
     activeSettings.revision = pendingSettings.revision;
   }
@@ -269,31 +282,46 @@ void acceptPressuresetpointEdit(int newValue) {
 // setpoint feeds myPID via a bound pointer (PID_v1 takes one at
 // construction), so it can't be replaced by a struct field directly; it
 // stays live-updated at the points where the effective value can change.
-// steam()/handleAdjust()'s "steam" override always takes precedence,
-// unchanged from before Phase 2.
+// Guarded by steamRequested, not steaming: steaming is a temperature-
+// threshold hysteresis flag (steam() sets it once input actually reaches
+// steamSetpoint-5, for the beep) and was never a "steam is wanted" flag.
+// Guarding on it here let a steam request made during the boiler's warm-up
+// (steaming still false) get silently overwritten back to the brew target
+// by the very next idle edit, shot start or shot end.
 void acceptBrewSetpointEdit(double newValue) {
   pendingSettings.setpoint = newValue;
   pendingSettings.revision++;
-  if (currentShotState == ShotState::IDLE) {
+  if (!acDetected) {
     activeSettings.setpoint = newValue;
     activeSettings.revision = pendingSettings.revision;
-    if (!steaming) setpoint = newValue;
+    if (!steamRequested) setpoint = newValue;
   }
 }
 
 // Validates and applies one ControlCommand. Mirrors the constrain() ranges
-// the original handleAdjust() enforced, and the pumppower side-effects it
-// had on preinftime/pressuresetpoint edits (a pre-existing quirk, preserved
-// rather than "fixed" here). Returns false for an unrecognized command,
-// matching the old handler's silent-no-op-then-200 behaviour for unknown
-// "var" values.
+// the original handleAdjust() enforced. Returns false for an unrecognized
+// command, matching the old handler's silent-no-op-then-200 behaviour for
+// unknown "var" values.
+//
+// `idle` is `!acDetected` - see the comment on acceptPreinftimeEdit() for
+// why currentShotState is not used here.
+//
+// The old handler's pumppower side-effect on preinftime/pressuresetpoint
+// edits (a pre-existing quirk, not something this PR set out to change) is
+// now gated on `idle` too: it used to write the live pumppower global
+// unconditionally, including mid-shot, which bypassed the settings latch
+// this PR exists to add - a mid-shot pressuresetpoint edit would leave
+// PressureTarget frozen in shotSettings (correct) while still slamming
+// pumppower to a new value immediately (not correct), producing a real,
+// unrequested pressure transient during the "protected" shot. Preserved
+// only for the idle case, where nothing is being protected.
 bool applyControlCommand(const ControlCommand& cmd) {
-  bool idle = (currentShotState == ShotState::IDLE);
+  bool idle = !acDetected;
   switch (cmd.type) {
     case ControlCommand::Type::SET_PREINFTIME: {
       int base = idle ? activeSettings.preinftime : pendingSettings.preinftime;
       acceptPreinftimeEdit(constrain(base + cmd.delta, 0, 20));
-      pumppower = basePumpPowerForSetpoint(PrePressureSetpoint);
+      if (idle) pumppower = basePumpPowerForSetpoint(PrePressureSetpoint);
       return true;
     }
     case ControlCommand::Type::SET_BLOOMTIME: {
@@ -310,13 +338,15 @@ bool applyControlCommand(const ControlCommand& cmd) {
       int base = idle ? activeSettings.pressuresetpoint : pendingSettings.pressuresetpoint;
       int newValue = constrain(base + cmd.delta, 3, 13);
       acceptPressuresetpointEdit(newValue);
-      pumppower = basePumpPowerForSetpoint(newValue);
+      if (idle) pumppower = basePumpPowerForSetpoint(newValue);
       return true;
     }
     case ControlCommand::Type::START_STEAM:
+      steamRequested = true;
       setpoint = steamSetpoint;
       return true;
     case ControlCommand::Type::STOP_STEAM:
+      steamRequested = false;
       setpoint = activeSettings.setpoint;
       return true;
     default:
@@ -598,10 +628,15 @@ void handleGetValues() {
   // expects to see that edit reflected immediately, whether idle or
   // mid-shot. While idle, pendingSettings == activeSettings, so this is
   // unchanged from Phase 1 in the common case.
+  //
+  // setpoint is the one exception: while steamRequested, the live PID
+  // target is steamSetpoint, not the (unrelated) brew target in
+  // pendingSettings - report the live value so this matches /temp and the
+  // chart during steam, same as before Phase 2.
   TelemetrySnapshot snap = buildTelemetrySnapshot();
 
   StaticJsonDocument<384> doc;
-  doc["setpoint"] = int(pendingSettings.setpoint - offset);
+  doc["setpoint"] = int((steamRequested ? setpoint : pendingSettings.setpoint) - offset);
   doc["preinftime"] = pendingSettings.preinftime;
   doc["bloomtime"] = pendingSettings.bloomtime;
   doc["pressure"] = snap.pressure;
@@ -818,8 +853,12 @@ void setupServerRoutes() {
     // than assigned directly: while idle this takes effect immediately,
     // matching the old behaviour; if a shot happens to be in progress it
     // becomes pending instead of altering that shot, same as an /adjust
-    // "setpoint" edit.
-    acceptBrewSetpointEdit((doc["setpoint"] | setpoint) + offset);
+    // "setpoint" edit. The fallback when the client omits "setpoint" reads
+    // pendingSettings (the canonical brew target), not the live `setpoint`
+    // global - the live value is whatever is currently driving the PID,
+    // which is steamSetpoint while steamRequested, and using it here would
+    // persist the steam target as the new brew setpoint.
+    acceptBrewSetpointEdit((doc["setpoint"] | (pendingSettings.setpoint - offset)) + offset);
     steamSetpoint = (doc["steamSetpoint"] | steamSetpoint) + offset;
     PIDonly = doc["PIDonly"] | PIDonly;
     currentMode = PIDonly ? OperatingMode::TEMP_ONLY : OperatingMode::NORMAL;
@@ -1025,7 +1064,7 @@ void loop() {
       shotStarted = true;
       shotSettings = activeSettings;
       shotSettings.preinftime = (shotSettings.bloomtime > 0 && shotSettings.preinftime < 5) ? 8 : shotSettings.preinftime;
-      if (!steaming) setpoint = shotSettings.setpoint;
+      if (!steamRequested) setpoint = shotSettings.setpoint;
     }
 
     // Calculate shot time
@@ -1112,7 +1151,7 @@ void loop() {
       // iteration; the next iteration's `else` branch below reports IDLE.
       currentShotState = ShotState::COMPLETE;
       activeSettings = pendingSettings;
-      if (!steaming) setpoint = activeSettings.setpoint;
+      if (!steamRequested) setpoint = activeSettings.setpoint;
     }
   } else {
     currentShotState = ShotState::IDLE;
