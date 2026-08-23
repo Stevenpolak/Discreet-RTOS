@@ -1,7 +1,7 @@
 # Two-task rewrite plan
 
 Status: awaiting required hardware validation  
-Current phase: Phase 0/1/2/3 merged to main and tagged (`v2.0.0-alpha`, `v2.0.1-beta`, `v2.0.2-beta`); none of their exit conditions are bench-verified yet - see docs/BASELINE.md, docs/PHASE1_NOTES.md, docs/PHASE2_NOTES.md and docs/PHASE3_NOTES.md for the outstanding bench checklists before Phase 4  
+Current phase: Phase 0/1/2/3 merged to main and tagged (`v2.0.0-alpha`, `v2.0.1-beta`, `v2.0.2-beta`); Phase 4 (task communication) implemented, in review - none of Phase 0-4's exit conditions are bench-verified yet - see docs/BASELINE.md, docs/PHASE1_NOTES.md, docs/PHASE2_NOTES.md, docs/PHASE3_NOTES.md and docs/PHASE4_NOTES.md for the outstanding bench checklists  
 Architecture target: one Arduino service loop plus one dedicated FreeRTOS control task
 
 This checklist is designed for work spread across multiple sessions. Finish and document one bounded step at a time; do not combine the architecture migration with unrelated behaviour changes.
@@ -182,18 +182,32 @@ the two new safety-positive behaviour changes this phase introduces.
 
 ### Phase 4 — Add safe task communication
 
-- [ ] Create the bounded command/settings queue.
-- [ ] Create the length-1 telemetry queue.
-- [ ] Publish telemetry with `xQueueOverwrite()`.
-- [ ] Read telemetry with `xQueuePeek()`.
-- [ ] Ensure queue operations used by either task are non-blocking or tightly bounded.
-- [ ] Reject unsafe or invalid settings inside the control owner.
-- [ ] Queue valid mid-shot edits as pending without changing `shotSettings`.
-- [ ] Coalesce repeated edits so the latest complete pending revision wins.
-- [ ] Test command bursts and slow/unavailable web clients.
-- [ ] Confirm no shared mutable control globals remain.
+**Started ahead of the outstanding Phase 0-3 bench checklist, on the same
+explicit-direction basis as Phases 2-3.** No FreeRTOS task exists yet -
+`commandQueue`/`telemetryQueue` have one producer and one consumer today,
+both the same single Arduino task - so this phase is lower actuator risk
+than Phase 3 (no actuator-write logic changes), but see
+[PHASE4_NOTES.md](PHASE4_NOTES.md) for a real caveat: the reasoning that
+makes `ControlCommand`'s relative-delta shape safe today may not survive
+Phase 5 unchanged.
 
-Exit condition: all cross-boundary data is copied through defined messages.
+- [x] Create the bounded command/settings queue. `commandQueue`, depth 8. See [PHASE4_NOTES.md](PHASE4_NOTES.md) §1.
+- [x] Create the length-1 telemetry queue. `telemetryQueue`. See [PHASE4_NOTES.md](PHASE4_NOTES.md) §3.
+- [x] Publish telemetry with `xQueueOverwrite()`. Once per `controlStep()` cycle, after the actuator writes.
+- [x] Read telemetry with `xQueuePeek()`. `handleGetValues()`, with a direct-build fallback if the queue isn't ready.
+- [x] Ensure queue operations used by either task are non-blocking or tightly bounded. All sends/receives/peeks use `0` ticks-to-wait; none can block.
+- [x] Reject unsafe or invalid settings inside the control owner. Unchanged from Phase 2/3 - `applyControlCommand()`'s `constrain()` calls are still the only validation, now reachable only from the queue-drain loop, never directly from a handler.
+- [x] Queue valid mid-shot edits as pending without changing `shotSettings`. Unchanged - the settings-lifecycle latch itself (Phase 2) doesn't change in this phase, only how commands reach `applyControlCommand()`.
+- [x] Coalesce repeated edits so the latest complete pending revision wins. Achieved without separate dedup logic - see [PHASE4_NOTES.md](PHASE4_NOTES.md) §2 for why draining in FIFO order and reading the current base at apply time already gives this property.
+- [ ] Test command bursts and slow/unavailable web clients. Not bench-tested (no hardware); the failure mode (an explicit `503` on a full queue, never a silent drop) is implemented and documented in [PHASE4_NOTES.md](PHASE4_NOTES.md)'s checklist.
+- [x] Confirm no shared mutable control globals remain. `TelemetrySnapshot` widened (`displaySetpoint`/`pendingPreinftime`/`pendingBloomtime`/`pendingPressuresetpoint`) so `handleGetValues()` no longer reads `pendingSettings`/`setpoint`/`steamRequested` directly; `/saveConfig`'s direct writes to `PIDonly`/`currentMode`/brew setpoint replaced with queued commands. `Kp`/`Ki`/`Kd`/`offset`/`steamSetpoint` remain direct, deliberately - see [PHASE4_NOTES.md](PHASE4_NOTES.md) §4.
+
+Exit condition: **met, with one caveat written down rather than
+resolved** - all cross-boundary data (settings edits, mode changes,
+telemetry) is copied through defined queue messages. The one thing not
+fully settled: whether `ControlCommand`'s relative-delta shape survives
+Phase 5 unchanged depends on that phase's own draining cadence - see
+[PHASE4_NOTES.md](PHASE4_NOTES.md) "What was intentionally not done."
 
 ### Phase 5 — Create the FreeRTOS control task
 
@@ -293,3 +307,4 @@ Rules for incremental work:
 | 2026-08-23 | Phase 3 | `phase3-centralize-control-ownership`, see PR | Started ahead of the outstanding bench checklist, on the same explicit-direction basis as Phase 2. Introduced `controlStep(now)` as the sole writer of both actuators: `runPID()` and the renamed `updatePumpRamp()` (was `SetPump()`) now only set `heaterDemand`/`pumpDemand`, and the six direct `light.setBrightness()` call sites in the shot-phase branches were replaced with `pumpDemand` assignments - collapsing what was 2 SSR write sites and 8 dimmer write sites down to exactly one of each, verified by grep. Added the output-priority resolution the plan calls for: a temperature fault now forces the pump off too (previously only the heater, with no coupling between a fault and the pump at all - a real gap this closes), continuously for as long as the fault persists; and an explicit mode-restriction layer forces the pump off in temp-only mode even if flipped there mid-shot, closing a second gap that existed since the original baseline. Both are genuine, intentional, safety-positive behaviour changes. `controlStep()` takes `now` as a parameter (matching the plan's own naming) and uses it for its own direct timestamp arithmetic, ahead of Phase 5's periodic-task needs. Compiles cleanly: 905,333 bytes flash (+44 vs `v2.0.1-beta`), 51,268 bytes RAM (+8). Full detail in `PHASE3_NOTES.md`. | Independent model review of this PR, then bench-test everything still outstanding from Phase 0-3 before Phase 4 |
 | 2026-08-23 | Phase 3 review fixes | `phase3-centralize-control-ownership`, see PR | Before dispatching the independent review, re-reading the diff found the most severe issue directly: an unconditional `pumpDemand = 0;` every cycle would have defeated `updatePumpRamp()`'s own ~50ms gate, driving the pump mostly off during the steady-state portion of every shot - fixed by removing the reset (matches the pre-Phase-3 `SetPump()` behaviour of simply not writing on ungated iterations). The subsequent 7-angle review found six more, all fixed: neither a fault nor a mid-shot mode change actually stopped the shot state machine, only the final write, so demand could wind up unseen underneath a masked pump and then slam to full power the instant the mask cleared - fixed with a new `endShot()` helper that a fault (or the normal AC-off debounce) both call, aborting the shot rather than leaving it running blind; that same fix closed a reintroduction of the Phase 2 "fault freezes settings edits" bug, since `endShot()` clears `acDetected`. `steam()` (which can block on an unbounded mutex via `queueBuzzer()`) was moved to run after the actuator writes instead of before, so nothing can delay the safety-critical write once a fault is detected. Fault-clearing gained hysteresis (3 consecutive good readings) so an intermittent sensor can't chatter the pump. The mode-restriction check was switched from the raw `PIDonly` bool to the Phase 2 `currentMode` enum designated as the source of truth. Added a defensive `constrain()` clamp at the single actuator-write choke point, and `resolvedHeaterOn`/`resolvedPumpPower` telemetry fields so a bench operator can actually observe a fault or mode restriction taking effect, rather than only seeing the pre-resolution demand. Compiles cleanly: 905,621 bytes flash (+332 vs the pre-fix commit), 51,284 bytes RAM (+24). Full detail in `PHASE3_NOTES.md` "Review round 1". | Get sign-off on the fixes, merge and tag, then bench-test everything outstanding from Phase 0-3 (see `BASELINE.md`, `PHASE1_NOTES.md`, `PHASE2_NOTES.md`, `PHASE3_NOTES.md`) before Phase 4 |
 | 2026-08-23 | Phase 3 tagged, merged | `main`, tag `v2.0.2-beta` | PR merged to `main` after the review fixes above; tagged and published as a pre-release. Bench checklist still outstanding at this point, now covering Phase 0-3. | Bench-test everything outstanding (see `BASELINE.md`, `PHASE1_NOTES.md`, `PHASE2_NOTES.md`, `PHASE3_NOTES.md`), or proceed with Phase 4 (safe task communication - queues) per the same explicit-direction basis as Phases 2-3, if directed |
+| 2026-08-23 | Phase 4 | `phase4-task-communication`, see PR | Started ahead of the outstanding Phase 0-3 bench checklist, on the same explicit-direction basis as Phases 2-3. Added `commandQueue` (bounded, depth 8) and `telemetryQueue` (length 1) - `handleAdjust()` and `/saveConfig` no longer call `applyControlCommand()`/`acceptBrewSetpointEdit()` or write `PIDonly`/`currentMode` directly; they only construct a `ControlCommand` and `xQueueSend()` it, non-blocking. `applyControlCommand()` (the "control owner") is now called from exactly one place: a queue-drain loop at the top of `controlStep()`, applying every currently-queued command in FIFO order before that cycle's control decisions run - this achieves "latest complete pending revision wins" coalescing for free, since each command reads the current settings base at apply time rather than at submission time, without needing separate dedup logic (see `PHASE4_NOTES.md` for why, and for the one caveat: this reasoning is specific to a single-task drain cadence and may need revisiting once Phase 5 actually splits the tasks apart). Added two new `ControlCommand` types (`SET_BREW_SETPOINT_ABSOLUTE`, `SET_MODE`) to close direct-global-write gaps in `/saveConfig`, including one the Phase 3 review had flagged and deferred (the safety-critical mode check reading a value written with no validation path). `TelemetrySnapshot` widened with `displaySetpoint`/`pendingPreinftime`/`pendingBloomtime`/`pendingPressuresetpoint` so `handleGetValues()` reads everything through `xQueuePeek()` instead of reaching into `pendingSettings`/`setpoint`/`steamRequested` directly. Compiles cleanly: 906,661 bytes flash (+1,040 vs `v2.0.2-beta`), 51,292 bytes RAM (+8). Full detail in `PHASE4_NOTES.md`. | Independent model review of this PR, then bench-test everything still outstanding from Phase 0-4 before Phase 5 |
