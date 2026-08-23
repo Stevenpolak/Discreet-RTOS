@@ -65,14 +65,23 @@ int pumppower = 0;
 int maxPressure = 12;
 double currentPressure = 0;
 
+// Actuator demand (Phase 3): what the temperature controller and the shot
+// state machine each *want*, computed by runPID()/updatePumpRamp() and the
+// shot-phase logic in controlStep(). Neither is an actuator write by
+// itself - controlStep() is the only place that reads these, resolves them
+// against fault/mode priority, and performs the actual digitalWrite(SSR_PIN)
+// / light.setBrightness() calls, once per cycle.
+bool heaterDemand = false;
+int pumpDemand = 0;
+
 // Timeing Intervals
 const unsigned long PRESS_INTERVAL = 50;  // X ms
 const unsigned long PID_INTERVAL = 250;  // X ms
 
-// Pump-power ramp cadence used by SetPump(): replaces a "every 4th qualifying
-// call" counter with an explicit elapsed-time interval (4 x PRESS_INTERVAL,
-// matching the original cadence) so the ramp rate no longer depends on how
-// often SetPump() happens to be entered.
+// Pump-power ramp cadence used by updatePumpRamp(): replaces a "every 4th
+// qualifying call" counter with an explicit elapsed-time interval (4 x
+// PRESS_INTERVAL, matching the original cadence) so the ramp rate no
+// longer depends on how often updatePumpRamp() happens to be entered.
 const unsigned long PUMP_ADJUST_INTERVAL = 200;  // X ms
 
 // AC-off debounce: how long syncPin must read continuously HIGH (off) before a
@@ -691,25 +700,29 @@ void getCurrentTheme() {
     server.send(200, "text/plain", theme);
 }
 
+// Computes heaterDemand - it does not write SSR_PIN itself. controlStep()
+// is the sole writer of actuator outputs (Phase 3); this only decides what
+// the temperature controller *wants*, which controlStep() then resolves
+// against fault/mode priority before writing the pin once per cycle.
 void runPID() {
 
   unsigned long PIDnow = millis();
 
-  if ((PIDnow - lastPIDTime >= PID_INTERVAL)) { 
+  if ((PIDnow - lastPIDTime >= PID_INTERVAL)) {
     lastPIDTime = PIDnow;
-    
+
     input = thermocouple.readCelsius();
 
     if (isnan(input) || input < 0 || input > 160) {
       currentFault = FaultCode::INVALID_TEMPERATURE;
-      digitalWrite(SSR_PIN, LOW); // SSR Off
-      return; // Exit function, SSR stays off
+      heaterDemand = false;
+      return;
     }
     currentFault = FaultCode::NONE;
 
     myPID.Compute();
 
-    digitalWrite(SSR_PIN, output >= 127 ? HIGH : LOW);
+    heaterDemand = (output >= 127);
 
   }
 }
@@ -760,7 +773,13 @@ int basePumpPowerForSetpoint(double Pumpsetpoint) {
   return 190;
 }
 
-void SetPump() {
+// Computes pumpDemand - it does not write the dimmer itself. controlStep()
+// is the sole writer of actuator outputs (Phase 3); this only decides what
+// the pressure-regulation ramp *wants*, which controlStep() then resolves
+// against fault/mode priority before writing the dimmer once per cycle.
+// Renamed from SetPump() (Phase 0-2) to reflect that it no longer sets
+// anything actuator-facing.
+void updatePumpRamp() {
 
   unsigned long now = millis();
 
@@ -779,8 +798,8 @@ void SetPump() {
     }
 
     // Fast - cut pump if overpressure every 50ms
-    if (currentPressure > PressureTarget + 0.3) {light.setBrightness(0);}
-    else {light.setBrightness(pumppower);}
+    if (currentPressure > PressureTarget + 0.3) { pumpDemand = 0; }
+    else { pumpDemand = pumppower; }
 
   }
 
@@ -1039,19 +1058,35 @@ void setup() {
   //setpoint = 10; // OVERIDE FOR DEVELOPMENT
 }
 
-void loop() {
+// The single boundary that owns all control decisions and both actuator
+// outputs (Phase 3, docs/REWRITE_PLAN.md "Centralize control ownership").
+// Everything above this point in the call chain (sensor sampling, the shot
+// state machine, the PID and pump-ramp computations) only ever sets
+// heaterDemand/pumpDemand or other control state; digitalWrite(SSR_PIN,...)
+// and light.setBrightness(...) are called exactly once each, at the very
+// end of this function, nowhere else. Still runs synchronously inside
+// loop() - no second task or queue yet (that's Phase 4/5).
+//
+// Takes `now` rather than calling millis() itself, matching the
+// controlStep(now) signature docs/REWRITE_PLAN.md names, and the periodic-
+// cycle pattern Phase 5's dedicated task will use (one now per cycle,
+// sampled by the caller, rather than several slightly-drifting millis()
+// reads taken at different points in the same logical cycle). GetPressure(),
+// runPID() and updatePumpRamp() still sample millis() themselves for their
+// own internal interval gates - only controlStep()'s own direct time
+// arithmetic (the AC-detect timestamp and the AC-off debounce) uses `now`.
+void controlStep(unsigned long now) {
 
-  ArduinoOTA.handle(); // Handle OTA updates
-  server.handleClient();
   GetPressure();
   runPID();
   steam();
   // AC detection
   if (digitalRead(syncPin) == LOW && !acDetected && !PIDonly) {
-    acDetectedTime = millis();
+    acDetectedTime = now;
     acDetected = true;
   }
 
+  pumpDemand = 0; // default: no shot in progress wants the pump on
 
   if (acDetected) {
 
@@ -1068,7 +1103,7 @@ void loop() {
     }
 
     // Calculate shot time
-    elapsedTime = millis() - acDetectedTime;
+    elapsedTime = now - acDetectedTime;
     actime = elapsedTime / 1000;
 
     // --- PRE-INFUSION ---
@@ -1076,24 +1111,24 @@ void loop() {
       currentShotState = ShotState::PREINFUSION;
       if (currentPressure <= PrePressureSetpoint - 1) {
         pumppower = 255;
-        light.setBrightness(pumppower);
+        pumpDemand = pumppower;
         pumpPowerSetPreinf = false;
       }
       else if (!pumpPowerSetPreinf) {
          PressureTarget = PrePressureSetpoint;
          pumppower = basePumpPowerForSetpoint(PressureTarget);
-         light.setBrightness(pumppower);
+         pumpDemand = pumppower;
          pumpPowerSetPreinf = true;  // prevents running again
-         SetPump();
+         updatePumpRamp();
       }
-      else SetPump();
+      else updatePumpRamp();
     }
 
     // --- BLOOM ---
     else if (shotSettings.bloomtime > 0 && actime < shotSettings.preinftime + shotSettings.bloomtime) {
       currentShotState = ShotState::BLOOM;
       pumppower = 0;
-      light.setBrightness(pumppower);
+      pumpDemand = pumppower;
     }
 
     // --- EXTRACTION ---
@@ -1101,17 +1136,17 @@ void loop() {
       currentShotState = ShotState::EXTRACTION;
       if (currentPressure < shotSettings.pressuresetpoint - 2) {
         pumppower = 255;
-        light.setBrightness(pumppower);
+        pumpDemand = pumppower;
         pumpPowerSetExtraction = false;
       }
       else if (!pumpPowerSetExtraction) {
          PressureTarget = shotSettings.pressuresetpoint;
          pumppower = basePumpPowerForSetpoint(PressureTarget); // runs once
-         light.setBrightness(pumppower);
+         pumpDemand = pumppower;
          pumpPowerSetExtraction = true;  // prevents it running again
-         SetPump();
+         updatePumpRamp();
       }
-      else SetPump();
+      else updatePumpRamp();
     }
 
     // AC turned off: require both elapsed wall-clock time AND a minimum
@@ -1126,7 +1161,7 @@ void loop() {
     if (digitalRead(syncPin) == HIGH) {
       if (!acOffPending) {
         acOffPending = true;
-        acOffSince = millis();
+        acOffSince = now;
         acOffSamples = 0;
       }
       acOffSamples++;
@@ -1136,12 +1171,12 @@ void loop() {
     }
 
     if (acOffPending && acOffSamples >= AC_OFF_MIN_SAMPLES &&
-        millis() - acOffSince >= AC_OFF_DEBOUNCE_MS) {
+        now - acOffSince >= AC_OFF_DEBOUNCE_MS) {
       acDetected = false;
       shotStarted = false;
       pumpPowerSetPreinf = false;
       pumpPowerSetExtraction = false;
-      light.setBrightness(0);
+      pumpDemand = 0;
       acOffPending = false;
       acOffSamples = 0;
 
@@ -1158,13 +1193,50 @@ void loop() {
   }
 
   // FAULT has priority over the phase label above, in any state
-  // (docs/REWRITE_PLAN.md "FAULT may be entered from any state"). This is
-  // telemetry/observability only in Phase 2 - none of the pump-control
-  // branches above are gated on fault status, so actuator behaviour is
-  // unchanged from Phase 1. Making FAULT actually override actuator
-  // outputs is Phase 3's job ("Apply output priority: fault/safety off,
-  // mode restrictions, state-machine demand, controller output").
+  // (docs/REWRITE_PLAN.md "FAULT may be entered from any state").
   if (currentFault != FaultCode::NONE) {
     currentShotState = ShotState::FAULT;
   }
+
+  // --- Output priority resolution and the only actuator write of the
+  // cycle (docs/REWRITE_PLAN.md "Apply output priority: fault/safety off,
+  // mode restrictions, state-machine demand, controller output") ---
+  bool heaterOut = heaterDemand;
+  int pumpOut = pumpDemand;
+
+  // 1. Fault/safety off - highest priority, overrides everything above.
+  // Previously (Phase 0-2) a temperature fault only forced the SSR off,
+  // synchronously inside runPID(); the pump was never coupled to it, so a
+  // fault occurring mid-shot left the pump running exactly as if nothing
+  // were wrong. This is the fix: any fault now forces both actuators off,
+  // every cycle for as long as it persists, regardless of what the shot
+  // state machine or PID computed.
+  if (currentFault != FaultCode::NONE) {
+    heaterOut = false;
+    pumpOut = 0;
+  }
+
+  // 2. Mode restrictions - temp-only must never enable the pump. Already
+  // true today as a side effect of AC detection being gated on !PIDonly
+  // (a shot can never start in temp-only mode, so pumpDemand can never
+  // become nonzero that way) - but that guarantee breaks if PIDonly is
+  // flipped to true via /saveConfig while a shot is already in progress,
+  // since nothing currently interrupts a running shot on a mode change.
+  // This is an explicit, independent second guarantee - not just restating
+  // the first one - and closes that gap.
+  if (PIDonly) {
+    pumpOut = 0;
+  }
+
+  // 3. Whatever remains is the state-machine demand, already resolved
+  // through the pressure-regulation controller output above. Write both
+  // actuators exactly once.
+  digitalWrite(SSR_PIN, heaterOut ? HIGH : LOW);
+  light.setBrightness(pumpOut);
+}
+
+void loop() {
+  ArduinoOTA.handle(); // Handle OTA updates
+  server.handleClient();
+  controlStep(millis());
 }
