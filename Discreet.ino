@@ -75,20 +75,40 @@ double currentPressure = 0;
 // Actuator demand (Phase 3): what the temperature controller and the shot
 // state machine each *want*, computed by runPID()/updatePumpRamp() and the
 // shot-phase logic in controlStep(). Neither is an actuator write by
-// itself - controlStep() is the only place that reads these, resolves them
-// against fault/mode priority, and performs the actual digitalWrite(SSR_PIN)
-// / light.setBrightness() calls, once per cycle.
-bool heaterDemand = false;
+// itself - controlStep() is the only place that reads these and resolves
+// them against fault/mode priority. heaterDemand is the raw PID output
+// (0-255, was a `bool` before Phase 6 - see runPID()); light.setBrightness()
+// is still called directly from controlStep(), but SSR_PIN is not - see
+// "Phase 6: time-proportional SSR output" below for why the heater path is
+// different now.
+double heaterDemand = 0;
 int pumpDemand = 0;
 
 // The actually-resolved output of the priority chain (Phase 3 review):
 // what got written to the actuators this cycle, after fault/mode
 // overrides, as opposed to heaterDemand/pumpDemand above which are what
-// was *asked for* before those overrides. Telemetry publishes these, not
+// was *asked for* before those overrides. Telemetry publishes this, not
 // the raw demand, so a bench operator (or the UI) can see a fault or a
 // mode restriction actually took effect rather than just trusting it did.
-bool resolvedHeaterOn = false;
+//
+// There is no equivalent resolvedHeaterOn global as of Phase 6 - found in
+// review that keeping one as a plain copy of controlStep()'s per-cycle
+// on/off decision would read back stale (and wrong) during exactly the
+// wedged-control-task scenario this whole phase exists to handle: it would
+// keep reporting whatever it was last set to, even after the deadman had
+// already forced the physical pin off. buildTelemetrySnapshot() instead
+// derives snap.heaterOn fresh, every time it's called (from whichever
+// task), directly from ssrAuthorizedUntilMs - the same check
+// ssrDeadmanCallback() itself uses - so telemetry can never show "on" once
+// the deadman has actually taken over.
 int resolvedPumpPower = 0;
+
+// Declared here (not down in "Phase 6: time-proportional SSR output" with
+// the rest of that machinery, further below) only because
+// buildTelemetrySnapshot() - defined well before that section - needs it in
+// scope. Full explanation of what this is and why it's a single field, not
+// a separate on/off flag, is on that section's copy of this comment.
+volatile unsigned long ssrAuthorizedUntilMs = 0;
 
 // Timeing Intervals
 const unsigned long PRESS_INTERVAL = 50;  // X ms
@@ -265,7 +285,7 @@ struct TelemetrySnapshot {
   double temperature;  // offset-corrected, deg C
   double pressure;      // bar
   int pumpPower;         // requested/ramped level, before fault/mode resolution (Phase 0-2 meaning, unchanged)
-  bool heaterOn;          // actually written to SSR_PIN this cycle, after resolution (Phase 3)
+  bool heaterOn;          // derived fresh from ssrAuthorizedUntilMs at snapshot-build time (Phase 6) - see buildTelemetrySnapshot()
   int resolvedPumpPower;  // actually written to the dimmer this cycle, after resolution (Phase 3)
   unsigned long elapsedShotTimeMs;
   unsigned long activeSettingsRevision;
@@ -440,7 +460,12 @@ TelemetrySnapshot buildTelemetrySnapshot(unsigned long now) {
   snap.temperature = input - offset;
   snap.pressure = currentPressure;
   snap.pumpPower = pumppower;
-  snap.heaterOn = resolvedHeaterOn;
+  // Derived fresh, not from a cached global (Phase 6 review) - reads
+  // exactly what ssrDeadmanCallback() itself would compute right now, from
+  // whichever task calls this (controlTask via controlStep(), or loopTask
+  // via handleGetValues()'s fallback), so it can never report "on" once an
+  // authorization has actually gone stale.
+  snap.heaterOn = (long)(ssrAuthorizedUntilMs - now) > 0;
   snap.resolvedPumpPower = resolvedPumpPower;
   snap.elapsedShotTimeMs = acDetected ? elapsedTime : 0;
   snap.activeSettingsRevision = activeSettings.revision;
@@ -638,11 +663,26 @@ int buzzerOnMs = 0;
 int buzzerOffMs = 0;
 esp_timer_handle_t buzzerTimer = nullptr;
 SemaphoreHandle_t buzzerMutex = nullptr;
+// See the comment on buzzerTimerCallback() below (Phase 6 review) - bounds
+// how long that callback may block the shared esp_timer service task.
+const TickType_t BUZZER_MUTEX_WAIT_TICKS = pdMS_TO_TICKS(20);
 
+// Bounded wait, not portMAX_DELAY (Phase 6 review) - this callback runs in
+// the shared esp_timer service task (ESP_TIMER_TASK dispatch), which also
+// now dispatches ssrDeadmanCallback() (the SSR safety deadman, see "Phase
+// 6: time-proportional SSR output" below). esp_timer dispatches every
+// ESP_TIMER_TASK callback serially in that one task, so an unbounded wait
+// here - if controlTask ever wedged while holding buzzerMutex inside
+// queueBuzzer() - would block the deadman from ever running again,
+// defeating the exact guarantee that phase exists to provide. On timeout,
+// this tick's work is simply skipped rather than touching buzzer state
+// without holding the mutex; the buzzer pattern stalling for one tick is a
+// cosmetic worst case, not a safety one, and BUZZER_MUTEX_WAIT_TICKS is
+// short enough that the deadman is never meaningfully delayed by it.
 void buzzerTimerCallback(void *arg) {
   uint64_t nextDelayUs = 0;
 
-  xSemaphoreTake(buzzerMutex, portMAX_DELAY);
+  if (xSemaphoreTake(buzzerMutex, BUZZER_MUTEX_WAIT_TICKS) != pdTRUE) return;
   if (buzzerActive && buzzerPinOn) {
     digitalWrite(BUZZER_PIN, LOW);
     buzzerPinOn = false;
@@ -707,6 +747,148 @@ void waitForBuzzer() {
   while (buzzerActive) {
     delay(1);
   }
+}
+
+// --- Phase 6: time-proportional SSR output + independent deadman
+// (docs/REWRITE_PLAN.md "Consider time-proportional SSR output separately")
+// ---
+//
+// Before this phase, controlStep() wrote SSR_PIN directly, synchronously,
+// as part of its own cycle - a control-task wedge (see Phase 5's Task WDT
+// item) left the pin at whatever it last was, for up to the WDT's timeout,
+// which is a real window for a heater to stay energized. This phase moves
+// the SSR write off the control task entirely: controlStep() only ever
+// updates an "authorization" (an on/off decision, plus a short expiry
+// timestamp); a separate, independent timer callback - not the control
+// task, not even running in the same task at all - is the only thing that
+// ever calls digitalWrite(SSR_PIN, ...), and it forces the pin off the
+// instant the authorization goes stale, regardless of controlTask's health.
+//
+// SSR_WINDOW_MS: the time-proportional window. controlStep() converts the
+// PID's 0-255 output into an on-time fraction of this window instead of the
+// old fixed `output >= 127` threshold - REWRITE_PLAN.md's "convert the full
+// PID output range to an on-time fraction." TODO(bench): 1s is a
+// conservative starting point for a resistive heating element behind a
+// solid-state relay (not a mechanical relay, so switching wear is not the
+// constraint - thermal/electrical response of the actual heater is); tune
+// against real hardware, same as every other *_INTERVAL constant in this
+// file marked TODO(bench).
+const unsigned long SSR_WINDOW_MS = 1000;
+
+// SSR_AUTH_TIMEOUT_MS: how long an authorization stays valid without being
+// refreshed. Must be comfortably larger than controlStep()'s own cycle time
+// (nominally 10ms; Phase 5's diagnostics report the actual worst case once
+// bench-measured - see PHASE5_NOTES.md) so ordinary cycle-to-cycle jitter
+// never trips it, and comfortably smaller than any duration a energized
+// heater staying on unsupervised should be tolerated for. 200ms is ~20x the
+// nominal cycle time headroom; TODO(bench): revisit once Phase 5's real
+// worst-case cycle time is measured.
+const unsigned long SSR_AUTH_TIMEOUT_MS = 200;
+
+// How often the deadman itself re-checks the authorization and drives the
+// pin - also, unavoidably, the actual output-resolution ceiling: the pin can
+// only change at this cadence, so 255 PID levels collapse onto
+// SSR_WINDOW_MS/SSR_ENFORCE_INTERVAL_MS achievable duty steps (50 at these
+// values), not the full 8-bit range - found in review (Phase 6). Matched to
+// controlStep()'s own 10ms cycle (not left at the original, arbitrarily
+// looser 20ms) so a fault/mode-change is reflected in at most one
+// controlStep() cycle plus one enforce tick, and so the deadman's own
+// staleness detection has the same granularity as the thing it's timing out
+// against. Still comfortably cheap: a single digitalWrite() at 100Hz.
+const unsigned long SSR_ENFORCE_INTERVAL_MS = 10;
+
+static_assert(SSR_AUTH_TIMEOUT_MS >= 4 * SSR_ENFORCE_INTERVAL_MS,
+  "SSR_AUTH_TIMEOUT_MS must stay several multiples of SSR_ENFORCE_INTERVAL_MS "
+  "above it, or the deadman's own poll grid becomes comparable to the "
+  "staleness budget it's supposed to be checking - found in review (Phase 6) "
+  "as a real risk if SSR_AUTH_TIMEOUT_MS is ever tuned down independently.");
+
+// ssrAuthorizedUntilMs (declared earlier in the file - see its own comment
+// there - so buildTelemetrySnapshot() has it in scope): written only by
+// controlStep() (controlTask), read only by ssrDeadmanCallback() (a
+// separate esp_timer task, below) and buildTelemetrySnapshot(). No queue/
+// mutex needed: a single word (unsigned long, 32-bit on this target),
+// atomic to read/write on this hardware, same reasoning Phase 5 review
+// applied to `offset`/`acDetected`-class globals.
+//
+// One field, not a separate on/off bool plus a deadline (found in review,
+// Phase 6: an earlier two-field design had a load-bearing but
+// compiler-unenforced write-ordering requirement between the two words, and
+// its own "off" case used the sentinel 0, which is not wraparound-safe -
+// see ssrDeadmanCallback() below). "SSR authorized on until this timestamp,
+// then off" is a single fact: a future value authorizes on until it
+// arrives; anything not in the future (including never having been set)
+// means off. Off needs no active re-assertion, because off is already the
+// deadman's fail-safe default - only the "stay on" case needs a live,
+// refreshed deadline.
+
+esp_timer_handle_t ssrDeadmanTimer = nullptr;
+
+// Updated at the top of every ssrDeadmanCallback() invocation; not safety-
+// load-bearing itself (the deadline check below is what actually protects
+// the pin) - this is purely an observability heartbeat so the *absence* of
+// deadman activity is detectable rather than silent, checked from loop()'s
+// diagnostics report (Phase 5 pattern) - see loop() below. Found necessary
+// in review: nothing else in this file would ever notice if the esp_timer
+// service task itself stopped running.
+volatile unsigned long ssrDeadmanLastRunMs = 0;
+
+// Set/cleared by ArduinoOTA's onStart/onEnd/onError callbacks (loopTask,
+// see setup()); read every cycle by controlStep() (controlTask), which
+// forces heaterOut off for as long as this is true - see the fault-priority
+// resolution below. A single bool write is atomic on this hardware, so no
+// queue is needed, matching offset/acDetected-class globals. Latched, not a
+// one-shot poke at ssrAuthorizedUntilMs - see the comment where
+// controlStep() reads this for why a one-shot version doesn't actually work.
+volatile bool otaInProgress = false;
+
+// The deadman itself. Runs in the esp_timer service task (ESP_TIMER_TASK
+// dispatch, matching this file's existing buzzerTimer pattern) - a real,
+// separate FreeRTOS task, at a fixed priority (ESP_TASK_TIMER_PRIO,
+// arithmetically confirmed = 22 on this target - configMAX_PRIORITIES(25) -
+// 3 - well above controlTask's 5), not the control task, so a wedged/
+// starved/crashed control task cannot prevent this from running by itself.
+// Its core affinity was NOT confirmed against this project's actual build
+// the way Phase 5 confirmed controlTask's (esp_timer's task is created
+// inside a precompiled library this environment has no source for) -
+// documented as an open item, not asserted as verified; see
+// docs/PHASE6_NOTES.md.
+//
+// This task is shared with buzzerTimerCallback() (pre-existing) - found in
+// review that an unbounded wait there could block this callback from ever
+// running again if controlTask wedged while holding buzzerMutex; fixed by
+// bounding that wait (see buzzerTimerCallback()'s own comment) rather than
+// by moving the deadman off this task, which would have needed true
+// interrupt-context (ESP_TIMER_ISR) code this project has no hardware to
+// validate - and which an ESP32 flash write/erase disables regardless of
+// dispatch method anyway (docs/PHASE5_NOTES.md §2), so it would not have
+// closed every gap either.
+//
+// Wraparound-safe comparison: `(long)(ssrAuthorizedUntilMs - now) > 0` -
+// the standard idiom for "is this unsigned-millis() deadline still in the
+// future," distinct from this file's usual `now - lastX >= INTERVAL` idiom
+// (a different question - "has at least this much time elapsed" - also
+// wraparound-safe, but the wrong shape for a deadline check). This idiom
+// only stays correct if "off" is ever encoded as a *relative*, not
+// absolute, sentinel - see controlStep()'s refresh and why it never writes
+// a literal 0 here (found in review: the original OTA-clear hook did
+// exactly that, which silently inverts into "authorized" after ~24.9 days
+// of uptime, once `now` exceeds 2^31).
+void ssrDeadmanCallback(void* arg) {
+  unsigned long now = millis();
+  ssrDeadmanLastRunMs = now;
+  bool authorized = (long)(ssrAuthorizedUntilMs - now) > 0;
+  digitalWrite(SSR_PIN, authorized ? HIGH : LOW);
+}
+
+bool initSsrDeadman() {
+  digitalWrite(SSR_PIN, LOW);  // known-safe default before the deadman is even running
+  esp_timer_create_args_t timerArgs = {};
+  timerArgs.callback = &ssrDeadmanCallback;
+  timerArgs.dispatch_method = ESP_TIMER_TASK;
+  timerArgs.name = "ssr_deadman";
+  if (esp_timer_create(&timerArgs, &ssrDeadmanTimer) != ESP_OK) return false;
+  return esp_timer_start_periodic(ssrDeadmanTimer, (uint64_t)SSR_ENFORCE_INTERVAL_MS * 1000) == ESP_OK;
 }
 
 //Functions
@@ -1015,9 +1197,10 @@ void getCurrentTheme() {
 }
 
 // Computes heaterDemand - it does not write SSR_PIN itself. controlStep()
-// is the sole writer of actuator outputs (Phase 3); this only decides what
-// the temperature controller *wants*, which controlStep() then resolves
-// against fault/mode priority before writing the pin once per cycle.
+// resolves this against fault/mode priority and hands the result to the
+// independent SSR deadman as a time-proportional authorization (Phase 6) -
+// it does not write the pin directly any more either; see
+// ssrDeadmanCallback().
 //
 // Clearing a fault requires FAULT_CLEAR_STABLE_READINGS consecutive valid
 // samples, not just one - found necessary in Phase 3 review: a temperature
@@ -1043,7 +1226,7 @@ void runPID() {
     if (isnan(input) || input < 0 || input > 160) {
       currentFault = FaultCode::INVALID_TEMPERATURE;
       faultClearStreak = 0;
-      heaterDemand = false;
+      heaterDemand = 0;
       return;
     }
     faultClearStreak++;
@@ -1053,7 +1236,11 @@ void runPID() {
 
     myPID.Compute();
 
-    heaterDemand = (output >= 127);
+    // Phase 6: the full PID output range (0-255) is now the demand, not a
+    // `output >= 127` binary threshold - controlStep() converts this into a
+    // time-proportional on/off authorization instead of a plain digital
+    // level. See "Phase 6: time-proportional SSR output" below.
+    heaterDemand = output;
 
   }
 }
@@ -1413,6 +1600,23 @@ void steam(){
 void setup() {
 
   Serial.begin(115200);
+
+  // SSR_PIN is set up and the deadman started before anything else in
+  // setup() - deliberately before even the boot delay below (Phase 6
+  // review: this used to run after WiFi/SD/OTA setup, tens of seconds into
+  // boot on a real network; GPIO13/MTCK floats on reset, so a warm reset
+  // that doesn't power-cycle the board - the Task WDT, or either
+  // ESP.restart() call later in this function - could leave a
+  // previously-energized heater's pin undriven for that whole window, with
+  // no deadman yet running to help). Nothing else in setup() needs to run
+  // first for this to work.
+  pinMode(SSR_PIN, OUTPUT);
+  if (!initSsrDeadman()) {
+    Serial.println("Failed to create SSR deadman timer - restarting");
+    delay(100);
+    ESP.restart();
+  }
+
   delay(2000);
 
   pinMode(BUZZER_PIN, OUTPUT);
@@ -1442,6 +1646,25 @@ void setup() {
   // OTA Setup
   ArduinoOTA.setHostname("Discreet"); // Set a unique hostname
   ArduinoOTA.setPassword("Discreet"); // Optional: Set a password for security
+  // Phase 6, docs/REWRITE_PLAN.md "Clear the current authorization
+  // immediately on ... OTA start": latches otaInProgress, which
+  // controlStep() checks every cycle for the whole OTA session (see its
+  // fault-priority resolution) - not a one-shot write to
+  // ssrAuthorizedUntilMs, which review found to be a no-op in practice
+  // (controlTask re-authorizes on its very next 10ms cycle regardless of
+  // what any other task just wrote, unless controlStep() itself is told to
+  // stop doing that). Cleared on both onEnd (success) and onError (abort/
+  // failure) so a failed OTA doesn't leave the heater permanently disabled
+  // until reboot.
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+  });
+  ArduinoOTA.onEnd([]() {
+    otaInProgress = false;
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+  });
   ArduinoOTA.begin(); // Start OTA service
 
   // === Web Routes ===
@@ -1452,7 +1675,7 @@ void setup() {
   Serial.println("HTTP server started.");
 
     //Dimmer Setup
-  pinMode(SSR_PIN, OUTPUT);
+  // SSR_PIN/the deadman are already set up - see the top of setup().
   pinMode(syncPin, INPUT);
   DimmableLight::setSyncPin(syncPin);
   DimmableLight::begin();
@@ -1536,13 +1759,19 @@ void endShot() {
 // outputs (Phase 3, docs/REWRITE_PLAN.md "Centralize control ownership").
 // Everything above this point in the call chain (sensor sampling, the shot
 // state machine, the PID and pump-ramp computations) only ever sets
-// heaterDemand/pumpDemand or other control state; digitalWrite(SSR_PIN,...)
-// and light.setBrightness(...) are called exactly once each, at the very
-// end of this function, nowhere else. Runs inside its own dedicated task
-// now (Phase 5, controlTaskEntry()), not inside loop() - cross-boundary
-// data flows exclusively through commandQueue/telemetryQueue (Phase 4),
-// which is exactly what makes this move a relocation rather than a
-// redesign: this function's own body did not need to change for Phase 5.
+// heaterDemand/pumpDemand or other control state. light.setBrightness(...)
+// is still called directly, exactly once, at the very end of this function.
+// The heater path is different since Phase 6: this function only ever
+// updates the SSR authorization (ssrAuthorizedUntilMs) - it
+// does not call digitalWrite(SSR_PIN, ...) itself any more; the independent
+// deadman (ssrDeadmanCallback()) is the only thing that does. Runs inside
+// its own dedicated task (Phase 5, controlTaskEntry()), not inside loop() -
+// cross-boundary data to/from the web side flows exclusively through
+// commandQueue/telemetryQueue (Phase 4); the SSR deadman is a second,
+// separate cross-task boundary this function talks to, deliberately kept
+// outside that same queue mechanism since it needs to be readable by a
+// task that must keep working even if commandQueue's normal consumer
+// (this function's own task) is the one that's wedged.
 //
 // Takes `now` rather than calling millis() itself, matching the
 // controlStep(now) signature docs/REWRITE_PLAN.md names, and the periodic-
@@ -1702,10 +1931,12 @@ void controlStep(unsigned long now) {
     currentShotState = ShotState::FAULT;
   }
 
-  // --- Output priority resolution and the only actuator write of the
-  // cycle (docs/REWRITE_PLAN.md "Apply output priority: fault/safety off,
-  // mode restrictions, state-machine demand, controller output") ---
-  bool heaterOut = heaterDemand;
+  // --- Output priority resolution (docs/REWRITE_PLAN.md "Apply output
+  // priority: fault/safety off, mode restrictions, state-machine demand,
+  // controller output") - the pump write is still the only actuator write
+  // for the pump; the heater path now hands off to the independent SSR
+  // deadman instead of writing SSR_PIN itself (Phase 6, see below). ---
+  double heaterOut = heaterDemand;
   int pumpOut = pumpDemand;
 
   // 1. Fault/safety off - highest priority, overrides everything above.
@@ -1715,9 +1946,27 @@ void controlStep(unsigned long now) {
   // were wrong. This is the fix: any fault now forces both actuators off,
   // every cycle for as long as it persists, regardless of what the shot
   // state machine or PID computed.
+  //
   if (faulted) {
-    heaterOut = false;
+    heaterOut = 0;
     pumpOut = 0;
+  }
+
+  // otaInProgress forces heaterOut off too (Phase 6, docs/REWRITE_PLAN.md
+  // "clear the current authorization immediately on ... OTA start") - kept
+  // as its own check, not folded into the faulted branch above, since it
+  // deliberately does NOT touch pumpOut: the plan's own wording is scoped
+  // to "the current [SSR] authorization," and gating the pump on OTA start
+  // would be a second, undiscussed behaviour change outside what this phase
+  // asked for. Found in review: an earlier version of this only zeroed
+  // ssrAuthorizedUntilMs once, directly, from ArduinoOTA.onStart() - a
+  // no-op in practice, since controlStep() unconditionally re-authorizes on
+  // its very next 10ms cycle regardless of what any other task just wrote.
+  // A latched flag this priority chain itself honors, every cycle, for the
+  // whole OTA session, is the actual fix - the same shape as `faulted`, not
+  // a one-shot poke at derived state.
+  if (otaInProgress) {
+    heaterOut = 0;
   }
 
   // 2. Mode restrictions - temp-only must never enable the pump. Already
@@ -1755,21 +2004,89 @@ void controlStep(unsigned long now) {
   // out-of-range int would silently wrap (e.g. -1 becomes 255, full
   // power) rather than fail loudly; nothing produces an out-of-range
   // value today, but this is the one choke point all pump output passes
-  // through, which is exactly where that guarantee belongs. Write both
-  // actuators exactly once, and record what was actually written for
-  // telemetry.
+  // through, which is exactly where that guarantee belongs.
   pumpOut = constrain(pumpOut, 0, 255);
-  resolvedHeaterOn = heaterOut;
+  heaterOut = constrain(heaterOut, 0, 255);
+
+  // Time-proportional SSR authorization (Phase 6, docs/REWRITE_PLAN.md
+  // "Convert the full PID output range to an on-time fraction instead of
+  // switching at a fixed value of 127").
+  //
+  // Window state is local to this function, not a global (found in review:
+  // nothing outside controlStep() should ever touch it, and `static` makes
+  // that a compiler fact instead of a comment). Sample/lock the on-time
+  // once per SSR_WINDOW_MS window, at the window's start, not continuously
+  // recomputed - standard practice for time-proportional control (avoids
+  // the on/off decision changing mid-window as the PID output drifts cycle
+  // to cycle, which would fragment what's supposed to be one contiguous
+  // on-pulse into several shorter ones). The window keeps rolling on its
+  // own schedule regardless of demand - found in review that an earlier
+  // version reset the window on every heaterOut<=0 cycle "to abort a window
+  // in progress like a fault," which sounds like the right instinct but
+  // isn't: heaterOut reaching exactly 0 is routine PID behaviour at/above
+  // setpoint (SetOutputLimits(0,255) saturates there), not just a fault
+  // condition, and resetting on every such cycle meant the *next* window's
+  // on-time was never sampled in time to use it - starving the heater for
+  // up to a full window on every ordinary zero-crossing. The gate below
+  // achieves the actual safety property (heat is authorized only on cycles
+  // where heaterOut is genuinely positive) without that cost: a fault still
+  // forces off on the very same cycle it's detected (via heaterOut being 0
+  // that cycle), it just doesn't need to also destroy the window's own
+  // bookkeeping to do it.
+  static unsigned long ssrWindowStartMs = 0;
+  static unsigned long ssrWindowOnTimeMs = 0;
+  if (now - ssrWindowStartMs >= SSR_WINDOW_MS) {
+    ssrWindowStartMs = now;
+    // Integer math, not heaterOut/255.0 (found in review: a double divide
+    // on every window rollover, on the highest-priority task, for no
+    // resolution benefit - SSR_ENFORCE_INTERVAL_MS is what actually bounds
+    // achievable on-time resolution, see its own comment - plus a
+    // NaN-unsafe path if heaterOut were ever non-finite). heaterOut is
+    // already constrain()-clamped to [0,255] above, and the NaN-safe gate
+    // below excludes non-finite/non-positive values before this line ever
+    // runs, so the cast to unsigned long here is always well-defined.
+    ssrWindowOnTimeMs = ((unsigned long)heaterOut * SSR_WINDOW_MS) / 255;
+  }
+  // `heaterOut > 0`, not `heaterOut <= 0` inverted (found in review): every
+  // comparison against NaN is false in IEEE 754, so `heaterOut <= 0` being
+  // false for NaN would let a non-finite PID output fall through to the
+  // *heat* branch - the opposite of fail-safe. `heaterOut > 0` is false for
+  // NaN, correctly treating it as "no heat," matching how this file already
+  // treats invalid sensor data everywhere else (runPID()'s own NaN check).
+  // A NaN heaterOut isn't reachable through any validated path today
+  // (PID_v1 clamps its own output, and JSON can't encode NaN), but
+  // SET_TUNINGS/SET_OFFSET (Phase 5 review) are explicitly unvalidated by
+  // design, so this is defense in depth for that boundary, not a response
+  // to a currently-reachable bug.
+  bool desiredHeaterOn = (heaterOut > 0) && (now - ssrWindowStartMs) < ssrWindowOnTimeMs;
+
+  // Never re-arm before this cycle's safety checks have passed
+  // (REWRITE_PLAN.md) - this line is reached only after the fault/OTA/mode
+  // resolution above has already run for this cycle. Refreshing the
+  // authorization every cycle (10ms), not just once per window, means a
+  // wedged control task is caught within SSR_AUTH_TIMEOUT_MS (200ms) of its
+  // last successful cycle, not up to a full SSR_WINDOW_MS (1000ms) later -
+  // strictly stronger than "refresh once per window."
+  //
+  // A single deadline, not a separate on/off flag (found in review,
+  // replacing an earlier two-field design - see ssrAuthorizedUntilMs's own
+  // comment for the full reasoning): "off" is `now`, not a fixed sentinel
+  // like `0` - `now` is always wraparound-safe relative to itself, whereas
+  // a fixed `0` silently reads as "authorized ~24.9 days from now" once
+  // millis() wraps past 2^31. Off doesn't need to look further into the
+  // future than the instant it's decided, because off is already the
+  // deadman's own fail-safe default - only "stay on" needs an active,
+  // forward-looking deadline.
   resolvedPumpPower = pumpOut;
-  digitalWrite(SSR_PIN, heaterOut ? HIGH : LOW);
+  ssrAuthorizedUntilMs = desiredHeaterOn ? (now + SSR_AUTH_TIMEOUT_MS) : now;
   light.setBrightness(pumpOut);
 
   // Publish telemetry for this cycle (Phase 4). xQueueOverwrite() never
   // blocks and never fails - it always succeeds by definition on a
   // length-1 queue, replacing whatever was there. Placed after the
-  // actuator writes so resolvedHeaterOn/resolvedPumpPower (read inside
-  // buildTelemetrySnapshot()) reflect what was actually just written, not
-  // the previous cycle's values.
+  // actuator writes so resolvedPumpPower/ssrAuthorizedUntilMs (both read
+  // inside buildTelemetrySnapshot()) reflect what was actually just
+  // written, not the previous cycle's values.
   if (telemetryQueue != nullptr) {
     TelemetrySnapshot snap = buildTelemetrySnapshot(now);
     xQueueOverwrite(telemetryQueue, &snap);
@@ -1816,5 +2133,19 @@ void loop() {
       controlTaskWorstCycleUs, controlTaskDeadlineMisses,
       (unsigned)uxTaskGetStackHighWaterMark(controlTaskHandle));
     controlTaskWorstCycleUs = 0;
+
+    // SSR deadman heartbeat (Phase 6 review): this doesn't protect
+    // SSR_PIN itself - the deadline check in ssrDeadmanCallback() already
+    // does that regardless of whether anything is watching it - it exists
+    // so the *absence* of deadman activity is visible somewhere, rather
+    // than silent, if the esp_timer service task itself ever stopped
+    // running entirely (nothing else in this file would otherwise notice).
+    // Threshold is generous - several multiples of SSR_ENFORCE_INTERVAL_MS
+    // - so it only fires on genuine starvation, not ordinary tick jitter.
+    if (nowMs - ssrDeadmanLastRunMs > 10 * SSR_ENFORCE_INTERVAL_MS) {
+      Serial.printf(
+        "WARNING: SSR deadman has not run in %lu ms (expected every %lu ms)\n",
+        nowMs - ssrDeadmanLastRunMs, SSR_ENFORCE_INTERVAL_MS);
+    }
   }
 }
