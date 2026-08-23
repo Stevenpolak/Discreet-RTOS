@@ -10,6 +10,7 @@
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
 #include <esp_timer.h>
+#include <esp_task_wdt.h>
 
 // Forward declarations for functions called before their point of
 // definition later in this file. Arduino's automatic prototype generation
@@ -272,6 +273,128 @@ struct TelemetrySnapshot {
 // snapshot (if any) was sitting unread, so the publisher never blocks and a
 // reader always gets the latest complete snapshot, never a partial one.
 QueueHandle_t telemetryQueue = nullptr;
+
+// --- Phase 5: dedicated control task (docs/REWRITE_PLAN.md "Create the
+// FreeRTOS control task") ---
+//
+// controlStep() itself is unchanged by this phase - it was already written
+// to take `now` as a parameter and to read commandQueue/write telemetryQueue
+// as its only cross-boundary contact points (Phase 4). This block only adds
+// the task that calls it on its own schedule, independent of loop().
+//
+// Period: 10 ms, per REWRITE_PLAN.md. GetPressure()/runPID()/
+// updatePumpRamp() already self-gate on PRESS_INTERVAL (50 ms) and
+// PID_INTERVAL (250 ms) via their own millis() checks - calling
+// controlStep() every 10 ms just makes those internal gates fire on their
+// intended cadence instead of on whatever cadence loop() happened to reach
+// controlStep() at; no restructuring of that gating was needed for this
+// phase, matching PHASE4_NOTES.md's framing of this as "a relocation, not a
+// redesign."
+const TickType_t CONTROL_TASK_PERIOD_TICKS = pdMS_TO_TICKS(10);
+
+// Priority/core, chosen deliberately rather than left at defaults:
+//
+// - Core 1 (APP_CPU): the same core Arduino's own loopTask runs on
+//   (CONFIG_ARDUINO_RUNNING_CORE defaults to 1), not core 0, where the
+//   Wi-Fi/BT driver's own high-priority tasks live. Sharing a core with
+//   loopTask - not with the radio stack - is the point: this task only
+//   needs to preempt server.handleClient()/ArduinoOTA.handle()/SD access,
+//   never to contend with Wi-Fi's own real-time deadlines for CPU time.
+// - Priority 5: strictly above loopTask's priority (hardcoded to 1 by the
+//   Arduino core), so the scheduler preempts loop() the instant this task's
+//   10 ms deadline arrives, regardless of what loop() is in the middle of.
+//   Kept well below the Wi-Fi/BT driver tasks' own priority (~23) so this
+//   task cannot starve the radio stack it shares a chip with, even though
+//   it doesn't share a core with those tasks' usual placement.
+// - Stack size 4096 bytes: controlStep() and everything it calls
+//   (GetPressure(), runPID() - PID_v1's double-precision math -,
+//   updatePumpRamp(), endShot(), buildTelemetrySnapshot(), a MAX6675 read)
+//   do no dynamic allocation and no String work; 4096 is a conservative
+//   starting budget, not a measurement - see uxTaskGetStackHighWaterMark()
+//   below and the bench checklist in PHASE5_NOTES.md.
+const uint32_t CONTROL_TASK_STACK_SIZE = 4096;
+const UBaseType_t CONTROL_TASK_PRIORITY = 5;
+const BaseType_t CONTROL_TASK_CORE = 1;
+
+TaskHandle_t controlTaskHandle = nullptr;
+
+// Forward declaration: controlTaskEntry() (below) calls controlStep(), but
+// controlStep() itself is defined later in this file (it needs
+// endShot()/buildTelemetrySnapshot() etc. in scope) - the Arduino build's
+// automatic prototype generation doesn't reach across this particular gap,
+// so this is written out explicitly rather than relying on it.
+void controlStep(unsigned long now);
+
+// Diagnostics (REWRITE_PLAN.md "measure worst observed cycle time and
+// deadline misses" / "measure stack high-water mark"): updated every cycle
+// inside controlTaskEntry(), reported over Serial at a low, human-readable
+// rate rather than added to TelemetrySnapshot/HTTP - this is bench
+// instrumentation, not a value the front end or /getValues consumers need,
+// and keeping it off the HTTP surface keeps this phase's scope to the
+// control-task migration itself.
+unsigned long controlTaskWorstCycleUs = 0;
+unsigned long controlTaskDeadlineMisses = 0;
+
+// The task function itself: subscribes to the Task WDT explicitly (per
+// REWRITE_PLAN.md, "do not rely on the watched idle tasks" - the default
+// arduino-esp32 TWDT setup watches the idle tasks as a proxy for a runaway
+// task starving them, which is a weaker guarantee than watching this task
+// directly), then runs controlStep() on a fixed period using
+// vTaskDelayUntil() so drift doesn't accumulate from this task's own
+// execution time.
+void controlTaskEntry(void* pvParameters) {
+  esp_err_t wdtErr = esp_task_wdt_add(NULL);
+  if (wdtErr != ESP_OK) {
+    // Not recoverable in any useful way from inside this task - if the
+    // explicit subscription itself failed (TWDT not initialized, or the
+    // watched-task table is full), the whole point of this phase's
+    // watchdog item is unmet. Logged loudly; controlStep() still runs
+    // regardless, since not running it is strictly less safe than running
+    // it unwatched.
+    Serial.printf("esp_task_wdt_add(controlTask) failed: %d\n", wdtErr);
+  }
+
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  unsigned long lastReportMs = millis();
+
+  for (;;) {
+    unsigned long cycleStartUs = micros();
+
+    controlStep(millis());
+
+    unsigned long cycleUs = micros() - cycleStartUs;
+    if (cycleUs > controlTaskWorstCycleUs) controlTaskWorstCycleUs = cycleUs;
+
+    // Feed the watchdog only after controlStep() has fully returned - i.e.
+    // only after a complete cycle including the safety evaluation and the
+    // actuator writes at the end of controlStep(), per REWRITE_PLAN.md. If
+    // controlStep() ever hangs, this line is simply never reached and the
+    // TWDT's own timeout - not this code - is what recovers the system.
+    esp_err_t resetErr = esp_task_wdt_reset();
+    if (resetErr != ESP_OK) {
+      Serial.printf("esp_task_wdt_reset(controlTask) failed: %d\n", resetErr);
+    }
+
+    // Deadline-miss detection: if this cycle's work alone consumed a full
+    // period or more, vTaskDelayUntil() below will return immediately
+    // (lastWakeTime is already due or past), which is the definition of a
+    // missed 10 ms deadline for this task.
+    if ((TickType_t)(xTaskGetTickCount() - lastWakeTime) >= CONTROL_TASK_PERIOD_TICKS) {
+      controlTaskDeadlineMisses++;
+    }
+
+    unsigned long nowMs = millis();
+    if (nowMs - lastReportMs >= 5000) {
+      lastReportMs = nowMs;
+      Serial.printf(
+        "controlTask: worst cycle %lu us, deadline misses %lu, stack headroom %u words\n",
+        controlTaskWorstCycleUs, controlTaskDeadlineMisses,
+        (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+
+    vTaskDelayUntil(&lastWakeTime, CONTROL_TASK_PERIOD_TICKS);
+  }
+}
 
 // Takes `now` rather than calling millis() itself - found in review (Phase
 // 4 efficiency angle): this is called once per controlStep() cycle, which
@@ -1233,6 +1356,18 @@ void setup() {
   
   delay(2000); //delay before anything starts happening.
   //setpoint = 10; // OVERIDE FOR DEVELOPMENT
+
+  // Started last, after everything controlStep() touches (queues, Dimmer,
+  // PID, SD-loaded config) is already initialized above (Phase 5,
+  // docs/REWRITE_PLAN.md "Create the FreeRTOS control task"). From this
+  // point on, controlStep() runs exclusively inside this task, on its own
+  // 10 ms schedule - loop() no longer calls it directly (see loop() below).
+  xTaskCreatePinnedToCore(
+    controlTaskEntry, "ControlTask", CONTROL_TASK_STACK_SIZE, nullptr,
+    CONTROL_TASK_PRIORITY, &controlTaskHandle, CONTROL_TASK_CORE);
+  if (controlTaskHandle == nullptr) {
+    Serial.println("Failed to create control task");
+  }
 }
 
 // Ends whatever shot is in progress: resets the shot-tracking flags, zeroes
@@ -1273,16 +1408,17 @@ void endShot() {
 // state machine, the PID and pump-ramp computations) only ever sets
 // heaterDemand/pumpDemand or other control state; digitalWrite(SSR_PIN,...)
 // and light.setBrightness(...) are called exactly once each, at the very
-// end of this function, nowhere else. Still runs synchronously inside
-// loop() - cross-boundary data now flows through commandQueue/
-// telemetryQueue (Phase 4), but there is still only one task; Phase 5 is
-// what actually moves this function into a dedicated FreeRTOS task.
+// end of this function, nowhere else. Runs inside its own dedicated task
+// now (Phase 5, controlTaskEntry()), not inside loop() - cross-boundary
+// data flows exclusively through commandQueue/telemetryQueue (Phase 4),
+// which is exactly what makes this move a relocation rather than a
+// redesign: this function's own body did not need to change for Phase 5.
 //
 // Takes `now` rather than calling millis() itself, matching the
 // controlStep(now) signature docs/REWRITE_PLAN.md names, and the periodic-
-// cycle pattern Phase 5's dedicated task will use (one now per cycle,
-// sampled by the caller, rather than several slightly-drifting millis()
-// reads taken at different points in the same logical cycle). GetPressure(),
+// cycle pattern controlTaskEntry() uses (one now per cycle, sampled by the
+// caller, rather than several slightly-drifting millis() reads taken at
+// different points in the same logical cycle). GetPressure(),
 // runPID() and updatePumpRamp() still sample millis() themselves for their
 // own internal interval gates - only controlStep()'s own direct time
 // arithmetic (the AC-detect timestamp and the AC-off debounce) uses `now`.
@@ -1524,8 +1660,11 @@ void controlStep(unsigned long now) {
   steam();
 }
 
+// controlStep() no longer runs here (Phase 5) - it runs in its own task
+// (controlTaskEntry(), created in setup()) on a fixed 10 ms schedule, so its
+// timing no longer depends on how long server.handleClient()/
+// ArduinoOTA.handle()/SD access take on any given iteration of this loop.
 void loop() {
   ArduinoOTA.handle(); // Handle OTA updates
   server.handleClient();
-  controlStep(millis());
 }
