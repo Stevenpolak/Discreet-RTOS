@@ -19,6 +19,12 @@
 // these are declared explicitly rather than relied on implicitly.
 int basePumpPowerForSetpoint(double Pumpsetpoint);
 String getContentType(String filename);
+// controlStep() has none of the constructs named above, but is declared
+// hundreds of lines away from controlTaskEntry() (Phase 5), the first thing
+// that calls it - ctags-based prototype generation didn't reach across that
+// gap either (confirmed by a failed build without this line), so it's
+// listed here too rather than left to chance.
+void controlStep(unsigned long now);
 
 // Wi-Fi Variables
 String ssid;
@@ -221,10 +227,21 @@ struct ControlCommand {
     START_STEAM,
     STOP_STEAM,
     SET_MODE,                    // absolute OperatingMode (from /saveConfig)
+    // Added in Phase 5 review: Kp/Ki/Kd (+ myPID.SetTunings()), steamSetpoint
+    // and offset were being written directly from /saveConfig (loopTask)
+    // while read by the now-genuinely-concurrent controlTask - a real
+    // torn-double/torn-PID-internal-state race that didn't exist before a
+    // second task did. Routing them through the same control-owner queue as
+    // everything else closes it the same way Phase 4 already closed it for
+    // brew setpoint/mode. See docs/PHASE5_NOTES.md.
+    SET_TUNINGS,                 // absolute Kp/Ki/Kd (from /saveConfig)
+    SET_STEAM_SETPOINT,          // absolute offset-adjusted value, reuses `value` (from /saveConfig)
+    SET_OFFSET,                  // absolute value, reuses `delta` (from /saveConfig)
   } type = Type::NONE;
-  int delta = 0;              // relative adjustment, used by the non-ABSOLUTE SET_* types
-  double value = 0;            // absolute value, used by SET_BREW_SETPOINT_ABSOLUTE
+  int delta = 0;              // relative adjustment (non-ABSOLUTE SET_* types) or absolute value (SET_OFFSET)
+  double value = 0;            // absolute value, used by SET_BREW_SETPOINT_ABSOLUTE / SET_STEAM_SETPOINT
   OperatingMode mode = OperatingMode::NORMAL;  // used by SET_MODE
+  double kp = 0, ki = 0, kd = 0;  // used by SET_TUNINGS
 };
 
 // Bounded command queue (Phase 4): the only channel by which an HTTP
@@ -295,17 +312,26 @@ const TickType_t CONTROL_TASK_PERIOD_TICKS = pdMS_TO_TICKS(10);
 // Priority/core, chosen deliberately rather than left at defaults:
 //
 // - Core 1 (APP_CPU): the same core Arduino's own loopTask runs on
-//   (CONFIG_ARDUINO_RUNNING_CORE defaults to 1), not core 0, where the
-//   Wi-Fi/BT driver's own high-priority tasks live. Sharing a core with
-//   loopTask - not with the radio stack - is the point: this task only
-//   needs to preempt server.handleClient()/ArduinoOTA.handle()/SD access,
-//   never to contend with Wi-Fi's own real-time deadlines for CPU time.
+//   (CONFIG_ARDUINO_RUNNING_CORE=1 for this target). Verified against this
+//   project's actual esp32:esp32@2.0.17 sdkconfig (Phase 5 review), not
+//   assumed: lwIP's tcpip_thread - which does the actual per-packet work
+//   behind server.handleClient() - is pinned to core 0
+//   (CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y), so core 1 is genuinely free of
+//   the one task that would matter most. The Arduino event task
+//   (arduino_events) does run on core 1 at a high priority
+//   (ESP_TASKD_EVENT_PRIO, ~19), but it is idle except for infrequent
+//   Wi-Fi/system events (connect/disconnect, got-IP), not a per-request cost.
 // - Priority 5: strictly above loopTask's priority (hardcoded to 1 by the
 //   Arduino core), so the scheduler preempts loop() the instant this task's
 //   10 ms deadline arrives, regardless of what loop() is in the middle of.
-//   Kept well below the Wi-Fi/BT driver tasks' own priority (~23) so this
-//   task cannot starve the radio stack it shares a chip with, even though
-//   it doesn't share a core with those tasks' usual placement.
+//   Kept well below arduino_events/lwIP/Wi-Fi driver priorities (~18-23) so
+//   this task cannot starve them.
+// - Known, deliberately-not-worked-around gap: an OTA write's flash
+//   erase/program calls disable interrupts and caches on both cores for its
+//   duration (an ESP32 SPI-flash/XIP hardware constraint, not a scheduling
+//   choice) - no core or priority choice prevents this task from being
+//   stalled during an OTA upload. See docs/PHASE5_NOTES.md; this is a bench
+//   item, not something core placement can fix.
 // - Stack size 4096 bytes: controlStep() and everything it calls
 //   (GetPressure(), runPID() - PID_v1's double-precision math -,
 //   updatePumpRamp(), endShot(), buildTelemetrySnapshot(), a MAX6675 read)
@@ -318,22 +344,21 @@ const BaseType_t CONTROL_TASK_CORE = 1;
 
 TaskHandle_t controlTaskHandle = nullptr;
 
-// Forward declaration: controlTaskEntry() (below) calls controlStep(), but
-// controlStep() itself is defined later in this file (it needs
-// endShot()/buildTelemetrySnapshot() etc. in scope) - the Arduino build's
-// automatic prototype generation doesn't reach across this particular gap,
-// so this is written out explicitly rather than relying on it.
-void controlStep(unsigned long now);
-
 // Diagnostics (REWRITE_PLAN.md "measure worst observed cycle time and
 // deadline misses" / "measure stack high-water mark"): updated every cycle
-// inside controlTaskEntry(), reported over Serial at a low, human-readable
-// rate rather than added to TelemetrySnapshot/HTTP - this is bench
-// instrumentation, not a value the front end or /getValues consumers need,
-// and keeping it off the HTTP surface keeps this phase's scope to the
-// control-task migration itself.
+// inside controlTaskEntry(), but *reported* from loop() (see the periodic
+// block near the bottom of this file), not from inside the control task
+// itself - found in review: Print::printf() falls back to malloc()+a second
+// vsnprintf() for any formatted string 64 bytes or longer (this report line
+// is longer than that), and Serial.write() can block once the UART's TX
+// FIFO fills - neither belongs inside the highest-priority, safety-critical
+// task, and both would have been silently excluded from the very cycle-time
+// measurement they were reporting. controlTaskWorstCycleMaxUs is reset after
+// each report so the number printed is a per-window worst case, not a
+// once-ever spike that then reads as "still there" forever.
 unsigned long controlTaskWorstCycleUs = 0;
 unsigned long controlTaskDeadlineMisses = 0;
+bool controlTaskWdtSubscribed = false;
 
 // The task function itself: subscribes to the Task WDT explicitly (per
 // REWRITE_PLAN.md, "do not rely on the watched idle tasks" - the default
@@ -344,23 +369,27 @@ unsigned long controlTaskDeadlineMisses = 0;
 // execution time.
 void controlTaskEntry(void* pvParameters) {
   esp_err_t wdtErr = esp_task_wdt_add(NULL);
-  if (wdtErr != ESP_OK) {
+  controlTaskWdtSubscribed = (wdtErr == ESP_OK);
+  if (!controlTaskWdtSubscribed) {
     // Not recoverable in any useful way from inside this task - if the
     // explicit subscription itself failed (TWDT not initialized, or the
     // watched-task table is full), the whole point of this phase's
-    // watchdog item is unmet. Logged loudly; controlStep() still runs
+    // watchdog item is unmet. Logged once, loudly; controlStep() still runs
     // regardless, since not running it is strictly less safe than running
-    // it unwatched.
+    // it unwatched. Logged once, not per-cycle: esp_task_wdt_reset() below
+    // is skipped for the rest of this task's life once subscription has
+    // failed (there being nothing to feed), so a per-cycle log here would
+    // otherwise flood Serial at 100 Hz forever - found in review.
     Serial.printf("esp_task_wdt_add(controlTask) failed: %d\n", wdtErr);
   }
 
   TickType_t lastWakeTime = xTaskGetTickCount();
-  unsigned long lastReportMs = millis();
 
   for (;;) {
+    unsigned long nowMs = millis();
     unsigned long cycleStartUs = micros();
 
-    controlStep(millis());
+    controlStep(nowMs);
 
     unsigned long cycleUs = micros() - cycleStartUs;
     if (cycleUs > controlTaskWorstCycleUs) controlTaskWorstCycleUs = cycleUs;
@@ -370,29 +399,29 @@ void controlTaskEntry(void* pvParameters) {
     // actuator writes at the end of controlStep(), per REWRITE_PLAN.md. If
     // controlStep() ever hangs, this line is simply never reached and the
     // TWDT's own timeout - not this code - is what recovers the system.
-    esp_err_t resetErr = esp_task_wdt_reset();
-    if (resetErr != ESP_OK) {
-      Serial.printf("esp_task_wdt_reset(controlTask) failed: %d\n", resetErr);
+    if (controlTaskWdtSubscribed) {
+      esp_err_t resetErr = esp_task_wdt_reset();
+      if (resetErr != ESP_OK) {
+        // Only reachable if the TWDT unsubscribed this task out from under
+        // it after a successful esp_task_wdt_add() (not expected - nothing
+        // in this file calls esp_task_wdt_delete()); still checked and
+        // logged per REWRITE_PLAN.md's "check and handle the return
+        // values," but this task never resubscribes, so this can print at
+        // most once per such an (unexpected) event, not every cycle.
+        Serial.printf("esp_task_wdt_reset(controlTask) failed: %d\n", resetErr);
+        controlTaskWdtSubscribed = false;
+      }
     }
 
-    // Deadline-miss detection: if this cycle's work alone consumed a full
-    // period or more, vTaskDelayUntil() below will return immediately
-    // (lastWakeTime is already due or past), which is the definition of a
-    // missed 10 ms deadline for this task.
-    if ((TickType_t)(xTaskGetTickCount() - lastWakeTime) >= CONTROL_TASK_PERIOD_TICKS) {
+    // vTaskDelayUntil() itself is the deadline-miss signal: it returns
+    // pdFALSE exactly when lastWakeTime was already due or past, i.e. this
+    // cycle's work alone consumed a full period or more - no need to
+    // separately re-derive that from the tick count (found in review: the
+    // original code did, redundantly and only to tick resolution instead of
+    // this call's own microsecond-driven timing).
+    if (xTaskDelayUntil(&lastWakeTime, CONTROL_TASK_PERIOD_TICKS) == pdFALSE) {
       controlTaskDeadlineMisses++;
     }
-
-    unsigned long nowMs = millis();
-    if (nowMs - lastReportMs >= 5000) {
-      lastReportMs = nowMs;
-      Serial.printf(
-        "controlTask: worst cycle %lu us, deadline misses %lu, stack headroom %u words\n",
-        controlTaskWorstCycleUs, controlTaskDeadlineMisses,
-        (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    }
-
-    vTaskDelayUntil(&lastWakeTime, CONTROL_TASK_PERIOD_TICKS);
   }
 }
 
@@ -558,6 +587,25 @@ bool applyControlCommand(const ControlCommand& cmd) {
       // persisted to config.json.
       PIDonly = (cmd.mode == OperatingMode::TEMP_ONLY);
       currentMode = cmd.mode;
+      return true;
+    // The three cases below (Phase 5 review) move Kp/Ki/Kd/SetTunings(),
+    // steamSetpoint and offset writes onto this exclusive-owner path -
+    // matching every other control-relevant write in this switch - so
+    // /saveConfig (loopTask) never mutates any of them directly. No new
+    // validation is added beyond what each already had (none): the fix
+    // here is the write's location, not new range-checking, which would be
+    // a separate, undiscussed behaviour change.
+    case ControlCommand::Type::SET_TUNINGS:
+      Kp = cmd.kp;
+      Ki = cmd.ki;
+      Kd = cmd.kd;
+      myPID.SetTunings(Kp, Ki, Kd);
+      return true;
+    case ControlCommand::Type::SET_STEAM_SETPOINT:
+      steamSetpoint = cmd.value;
+      return true;
+    case ControlCommand::Type::SET_OFFSET:
+      offset = cmd.delta;
       return true;
     default:
       return false;
@@ -870,13 +918,24 @@ void handleGetValues() {
   // resolved for steamRequested (see buildTelemetrySnapshot()).
   //
   // Read via xQueuePeek() (Phase 4), not by calling buildTelemetrySnapshot()
-  // directly: this handler runs in server.handleClient(), which is called
-  // before controlStep() in loop() every iteration, so it was already
-  // reading state "as of the end of the previous cycle" even before this
-  // phase - the queue just makes that explicit and, from Phase 5 on, safe
-  // across an actual task boundary. Falls back to building one directly
-  // only if the queue isn't ready yet (e.g. a request arriving before
-  // controlStep() has run even once, or queue creation failed in setup()).
+  // directly: this always returns the latest snapshot controlTask has
+  // published, never a partial one, and never blocks this handler. Falls
+  // back to building one directly only if the queue isn't ready yet (e.g. a
+  // request arriving before controlStep() has run even once, or queue
+  // creation failed in setup()).
+  //
+  // Before Phase 5, this handler ran in server.handleClient(), which loop()
+  // called immediately before controlStep() every iteration, so an /adjust
+  // request handled this same iteration was already guaranteed to be
+  // drained and reflected here by construction. That ordering guarantee is
+  // gone now that controlTask runs independently (found in review: the
+  // comment here previously still asserted it) - a request landing within
+  // the same ~10 ms window as the edit it's meant to reflect can read the
+  // previous cycle's snapshot. Relative-delta commands (SET_PREINFTIME etc.)
+  // self-correct on the next poll rather than compounding, since
+  // applyControlCommand() always applies against the current base at drain
+  // time (see docs/PHASE4_NOTES.md §2) - a UI showing one stale read is a
+  // display lag, not a lost or duplicated edit.
   TelemetrySnapshot snap;
   if (telemetryQueue == nullptr || xQueuePeek(telemetryQueue, &snap, 0) != pdTRUE) {
     snap = buildTelemetrySnapshot(millis());
@@ -889,7 +948,16 @@ void handleGetValues() {
   doc["pressure"] = snap.pressure;
   doc["pumppower"] = snap.pumpPower;
   doc["pressuresetpoint"] = snap.pendingPressuresetpoint;
-  doc["actime"] = actime;
+  // snap.elapsedShotTimeMs, not the raw `actime` global - found in review
+  // (Phase 5): `actime` is written only inside controlTask's `if
+  // (acDetected)` branch and is never reset when a shot ends, so reading it
+  // directly here was both a live cross-task read of a controlTask-owned
+  // value (undefined relative to whatever snap/shotState this response
+  // otherwise reports) and stale forever after the last shot's end -
+  // snap.elapsedShotTimeMs is already the same-cycle-consistent, correctly
+  // zeroed (buildTelemetrySnapshot(): `acDetected ? elapsedTime : 0`)
+  // equivalent already sitting in the snapshot this handler already peeked.
+  doc["actime"] = snap.elapsedShotTimeMs / 1000;
   doc["temp"] = snap.temperature;
   doc["Kp"] = Kp;
   doc["Ki"] = Ki;
@@ -1046,8 +1114,16 @@ void updatePumpRamp() {
 
   unsigned long now = millis();
 
-  // Only update after boost every xxx ms
-  if (now - DimlastUpdate > PRESS_INTERVAL) {
+  // Only update after boost every xxx ms. `>=`, not `>` - found in review
+  // (Phase 5): this function's caller now runs on an exact 10 ms grid
+  // (controlTaskEntry()), so `now` advances in clean 10 ms steps relative to
+  // DimlastUpdate; a strict `>` against PRESS_INTERVAL=50 is never true at
+  // exactly +50 ms, so the gate only fired at +60 ms - silently stretching
+  // this to a 60 ms cadence (and PUMP_ADJUST_INTERVAL's nested gate, only
+  // reachable from here, to 240 ms instead of 200) instead of the intended
+  // 50 ms. Previously loop()'s irregular, sub-millisecond cadence meant
+  // `now` almost never landed on the exact boundary, so this was latent.
+  if (now - DimlastUpdate >= PRESS_INTERVAL) {
     DimlastUpdate = now;
 
     // Slow - adjust pump power every PUMP_ADJUST_INTERVAL of elapsed time,
@@ -1125,28 +1201,61 @@ void setupServerRoutes() {
   
     file.close();
 
-    Kp = doc["Kp"];
-    Ki = doc["Ki"];
-    Kd = doc["Kd"];
-    myPID.SetTunings(Kp, Ki, Kd); 
+    // Every field below is now sent through commandQueue and applied only
+    // by applyControlCommand() inside controlTask - none of Kp/Ki/Kd/
+    // myPID.SetTunings()/offset/steamSetpoint/setpoint/mode are written
+    // directly from this handler (loopTask) any more (Phase 5 review; see
+    // docs/PHASE5_NOTES.md). Before this fix, all of them were: harmless
+    // with a single task (Phase 0-4), but a real cross-task race once
+    // controlTask genuinely runs concurrently (Phase 5) - Kp/Ki/Kd feed
+    // myPID.SetTunings(), which can tear against a concurrent
+    // myPID.Compute(); setpoint/steamSetpoint are non-atomic doubles read
+    // directly by the PID and by applyControlCommand()'s clamp.
+    //
+    // A field the client's JSON omits is simply not sent - no command at
+    // all, not a "resend the current value" no-op - which also removes the
+    // need to ever read pendingSettings.setpoint/PIDonly back out of
+    // control-owned state from this handler: the previous fallback
+    // (`doc["setpoint"] | (pendingSettings.setpoint - offset)`) read a
+    // struct controlTask can be mid-write to, and a torn double there could
+    // reach applyControlCommand()'s constrain() as NaN (constrain()'s
+    // comparisons all fail on NaN, so the clamp would silently pass a NaN
+    // setpoint through), permanently stalling the heater with no fault
+    // raised. Omitting the command instead of reconstructing the current
+    // value sidesteps that read entirely.
+    bool tuningsOk = true;
+    if (!doc["Kp"].isNull() && !doc["Ki"].isNull() && !doc["Kd"].isNull()) {
+      ControlCommand tuningsCmd;
+      tuningsCmd.type = ControlCommand::Type::SET_TUNINGS;
+      tuningsCmd.kp = doc["Kp"];
+      tuningsCmd.ki = doc["Ki"];
+      tuningsCmd.kd = doc["Kd"];
+      tuningsOk = sendControlCommand(tuningsCmd);
+    }
 
-    offset = doc["offset"] | offset;
-    // Routed through the command queue (Phase 4; the settings-lifecycle
-    // accept path itself is unchanged from Phase 2): while idle this takes
-    // effect immediately, matching the old behaviour; if a shot happens to
-    // be in progress it becomes pending instead of altering that shot,
-    // same as an /adjust "setpoint" edit. The fallback when the client
-    // omits "setpoint" reads pendingSettings (the canonical brew target),
-    // not the live `setpoint` global - the live value is whatever is
-    // currently driving the PID, which is steamSetpoint while
-    // steamRequested, and using it here would persist the steam target as
-    // the new brew setpoint.
-    ControlCommand setpointCmd;
-    setpointCmd.type = ControlCommand::Type::SET_BREW_SETPOINT_ABSOLUTE;
-    setpointCmd.value = (doc["setpoint"] | (pendingSettings.setpoint - offset)) + offset;
-    bool setpointSent = sendControlCommand(setpointCmd);
+    bool offsetOk = true;
+    if (!doc["offset"].isNull()) {
+      ControlCommand offsetCmd;
+      offsetCmd.type = ControlCommand::Type::SET_OFFSET;
+      offsetCmd.delta = doc["offset"];
+      offsetOk = sendControlCommand(offsetCmd);
+    }
 
-    steamSetpoint = (doc["steamSetpoint"] | steamSetpoint) + offset;
+    bool setpointOk = true;
+    if (!doc["setpoint"].isNull()) {
+      ControlCommand setpointCmd;
+      setpointCmd.type = ControlCommand::Type::SET_BREW_SETPOINT_ABSOLUTE;
+      setpointCmd.value = (double)doc["setpoint"] + offset;
+      setpointOk = sendControlCommand(setpointCmd);
+    }
+
+    bool steamOk = true;
+    if (!doc["steamSetpoint"].isNull()) {
+      ControlCommand steamCmd;
+      steamCmd.type = ControlCommand::Type::SET_STEAM_SETPOINT;
+      steamCmd.value = (double)doc["steamSetpoint"] + offset;
+      steamOk = sendControlCommand(steamCmd);
+    }
 
     // Also routed through the queue (Phase 4) rather than writing PIDonly/
     // currentMode directly: this is safety-critical state (the actuator
@@ -1154,26 +1263,29 @@ void setupServerRoutes() {
     // docs/PHASE3_NOTES.md "Review round 1"), so it goes through the same
     // control-owner-validated path as everything else instead of being a
     // direct cross-context write.
-    ControlCommand modeCmd;
-    modeCmd.type = ControlCommand::Type::SET_MODE;
-    modeCmd.mode = (doc["PIDonly"] | PIDonly) ? OperatingMode::TEMP_ONLY : OperatingMode::NORMAL;
-    bool modeSent = sendControlCommand(modeCmd);
+    bool modeOk = true;
+    if (!doc["PIDonly"].isNull()) {
+      ControlCommand modeCmd;
+      modeCmd.type = ControlCommand::Type::SET_MODE;
+      modeCmd.mode = doc["PIDonly"] ? OperatingMode::TEMP_ONLY : OperatingMode::NORMAL;
+      modeOk = sendControlCommand(modeCmd);
+    }
 
     Serial.println("Config saved");
 
     // Found in review (Phase 4): the SD write above already committed the
     // new config.json by this point (config.json is a separate, unqueued
     // persistence path this phase doesn't change - see PHASE4_NOTES.md),
-    // but the in-memory setpoint/mode only take effect if both sends above
+    // but the in-memory state only takes effect if every send above
     // actually succeeded. Report a failure here rather than answering
     // "Saved" when the running machine and the file it just wrote can
     // disagree - the same 503-on-full-queue behaviour handleAdjust() already
     // has, extended to the one handler that previously had no way to signal
     // it at all.
-    if (setpointSent && modeSent) {
+    if (tuningsOk && offsetOk && setpointOk && steamOk && modeOk) {
       server.send(200, "text/plain", "Saved");
     } else {
-      server.send(503, "text/plain", "Saved to file, but busy - setpoint/mode not applied yet, try again");
+      server.send(503, "text/plain", "Saved to file, but busy - some settings not applied yet, try again");
     }
 
   });
@@ -1362,11 +1474,29 @@ void setup() {
   // docs/REWRITE_PLAN.md "Create the FreeRTOS control task"). From this
   // point on, controlStep() runs exclusively inside this task, on its own
   // 10 ms schedule - loop() no longer calls it directly (see loop() below).
-  xTaskCreatePinnedToCore(
+  // Checks xTaskCreatePinnedToCore()'s own return value (pdPASS/pdFAIL),
+  // not just whether controlTaskHandle got written - found in review: the
+  // out-param is only populated on success by contract, so testing it for
+  // nullptr instead of checking the return code worked only because the
+  // handle happens to be a zero-initialized global.
+  BaseType_t controlTaskCreated = xTaskCreatePinnedToCore(
     controlTaskEntry, "ControlTask", CONTROL_TASK_STACK_SIZE, nullptr,
     CONTROL_TASK_PRIORITY, &controlTaskHandle, CONTROL_TASK_CORE);
-  if (controlTaskHandle == nullptr) {
-    Serial.println("Failed to create control task");
+  if (controlTaskCreated != pdPASS) {
+    // Found in review: this task is the only thing that ever calls
+    // controlStep() (Phase 5) - if it fails to start, nothing would ever
+    // read a sensor, evaluate a fault, or write an actuator again, while
+    // the web server stays fully up and keeps answering /getValues from its
+    // buildTelemetrySnapshot() fallback, i.e. the machine would look alive
+    // and controlled while actually being neither. A log line and
+    // continuing into loop() is not an acceptable outcome for that failure
+    // mode. Restarting is: it costs a reboot (same as any other startup
+    // failure this file already treats as fatal-enough to be worth calling
+    // out loudly), and gives a heap-exhaustion-at-boot condition a chance to
+    // clear rather than running the machine with no control loop at all.
+    Serial.println("Failed to create control task - restarting");
+    delay(100);  // let the Serial line above actually go out before reset
+    ESP.restart();
   }
 }
 
@@ -1667,4 +1797,24 @@ void controlStep(unsigned long now) {
 void loop() {
   ArduinoOTA.handle(); // Handle OTA updates
   server.handleClient();
+
+  // Reports controlTask's diagnostics counters (Phase 5) - deliberately
+  // printed from here, not from inside controlTaskEntry() itself: found in
+  // review that a Serial.printf() long enough to hit Print::printf()'s
+  // malloc() fallback (its stack buffer is 64 bytes; this line is longer),
+  // and Serial.write()'s potential to block once the UART TX FIFO fills,
+  // both belonged nowhere near the highest-priority, safety-critical task.
+  // loop() has no such constraint. controlTaskWorstCycleUs is reset after
+  // each report so the number is a per-5s-window worst case, not a single
+  // early spike that then reads as "still there" for the rest of uptime.
+  static unsigned long lastReportMs = 0;
+  unsigned long nowMs = millis();
+  if (nowMs - lastReportMs >= 5000) {
+    lastReportMs = nowMs;
+    Serial.printf(
+      "controlTask: worst cycle %lu us, deadline misses %lu, stack headroom %u bytes\n",
+      controlTaskWorstCycleUs, controlTaskDeadlineMisses,
+      (unsigned)uxTaskGetStackHighWaterMark(controlTaskHandle));
+    controlTaskWorstCycleUs = 0;
+  }
 }
