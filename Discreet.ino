@@ -9,6 +9,7 @@
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
+#include <esp_timer.h>
 
 
 // Wi-Fi Variables
@@ -59,12 +60,36 @@ int maxPressure = 12;
 double currentPressure = 0;
 
 // Timeing Intervals
-const int PRESS_INTERVAL = 50;  // X ms
-const int PID_INTERVAL = 250;  // X ms
+const unsigned long PRESS_INTERVAL = 50;  // X ms
+const unsigned long PID_INTERVAL = 250;  // X ms
+
+// Pump-power ramp cadence used by SetPump(): replaces a "every 4th qualifying
+// call" counter with an explicit elapsed-time interval (4 x PRESS_INTERVAL,
+// matching the original cadence) so the ramp rate no longer depends on how
+// often SetPump() happens to be entered.
+const unsigned long PUMP_ADJUST_INTERVAL = 200;  // X ms
+
+// AC-off debounce: how long syncPin must read continuously HIGH (off) before a
+// shot is considered ended. Replaces a loop-iteration counter (previously 100
+// iterations) so shot-end detection no longer depends on loop() speed.
+//
+// Elapsed wall-clock time alone is not sufficient here: millis() keeps
+// advancing even while loop() is stalled (e.g. inside the SD/OTA paths
+// documented as blocking in docs/PHASE1_NOTES.md), so a stall could let a
+// single post-stall sample satisfy a pure time check. AC_OFF_MIN_SAMPLES
+// additionally requires that many real digitalRead() samples were taken
+// during the debounce window, so a stall bookended by only one or two
+// samples cannot end a shot on its own.
+// TODO(bench): both constants are judgement calls, not measurements against
+// real hardware; confirm on the bench before relying on them (see
+// docs/PHASE1_NOTES.md).
+const unsigned long AC_OFF_DEBOUNCE_MS = 300;
+const int AC_OFF_MIN_SAMPLES = 20;
 
 // Timer Variables
 unsigned long lastPIDTime = 0;
 unsigned long DimlastUpdate = 0;
+unsigned long lastPumpAdjust = 0;
 unsigned long LastPressCall = 0;
 unsigned long lastPrintTime = 0;
 unsigned long acDetectedTime = 0;
@@ -87,9 +112,98 @@ bool pumpPowerSetPreinf = false;
 bool pumpPowerSetExtraction = false;
 
 int bloomtime = 0;
-int offcount = 0;
+// AC-off debounce state. acOffPending is true once syncPin has been observed
+// HIGH (off) at least once since it was last LOW (on); acOffSince is the
+// millis() timestamp of that first HIGH sample; acOffSamples counts how many
+// HIGH samples have actually been taken since then (see AC_OFF_MIN_SAMPLES).
+// Replaces the old loop-iteration offcount.
+bool acOffPending = false;
+unsigned long acOffSince = 0;
+int acOffSamples = 0;
 
 DimmableLight light(thyristorPin);
+
+// --- Timer-driven buzzer sequencer -----------------------------------------
+// An ESP one-shot timer advances the pattern independently of loop(), so a
+// slow web, SD or OTA call cannot stretch an ON pulse. This uses the ESP timer
+// service, not another application-owned FreeRTOS task.
+volatile bool buzzerActive = false;
+bool buzzerPinOn = false;
+int buzzerBeepsRemaining = 0;
+int buzzerOnMs = 0;
+int buzzerOffMs = 0;
+esp_timer_handle_t buzzerTimer = nullptr;
+SemaphoreHandle_t buzzerMutex = nullptr;
+
+void buzzerTimerCallback(void *arg) {
+  uint64_t nextDelayUs = 0;
+
+  xSemaphoreTake(buzzerMutex, portMAX_DELAY);
+  if (buzzerActive && buzzerPinOn) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerPinOn = false;
+    nextDelayUs = (uint64_t)buzzerOffMs * 1000;
+  } else if (buzzerActive) {
+    buzzerBeepsRemaining--;
+    if (buzzerBeepsRemaining <= 0) {
+      buzzerActive = false;
+    } else {
+      digitalWrite(BUZZER_PIN, HIGH);
+      buzzerPinOn = true;
+      nextDelayUs = (uint64_t)buzzerOnMs * 1000;
+    }
+  }
+
+  if (nextDelayUs > 0 && esp_timer_start_once(buzzerTimer, nextDelayUs) != ESP_OK) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerPinOn = false;
+    buzzerActive = false;
+  }
+  xSemaphoreGive(buzzerMutex);
+}
+
+bool initBuzzer() {
+  buzzerMutex = xSemaphoreCreateMutex();
+  if (buzzerMutex == nullptr) return false;
+
+  esp_timer_create_args_t timerArgs = {};
+  timerArgs.callback = &buzzerTimerCallback;
+  timerArgs.dispatch_method = ESP_TIMER_TASK;
+  timerArgs.name = "buzzer";
+  return esp_timer_create(&timerArgs, &buzzerTimer) == ESP_OK;
+}
+
+void queueBuzzer(int times, int beepDurationMs, int pauseDurationMs) {
+  if (times <= 0 || beepDurationMs <= 0 || pauseDurationMs <= 0 ||
+      buzzerTimer == nullptr || buzzerMutex == nullptr) return;
+
+  xSemaphoreTake(buzzerMutex, portMAX_DELAY);
+  // The original blocking function could not overlap itself. Keep that
+  // single-pattern contract and avoid replacing a timer while its callback
+  // may be in flight.
+  if (buzzerActive) {
+    xSemaphoreGive(buzzerMutex);
+    return;
+  }
+  buzzerOnMs = beepDurationMs;
+  buzzerOffMs = pauseDurationMs;
+  buzzerBeepsRemaining = times;
+  buzzerPinOn = true;
+  buzzerActive = true;
+  digitalWrite(BUZZER_PIN, HIGH);
+  if (esp_timer_start_once(buzzerTimer, (uint64_t)buzzerOnMs * 1000) != ESP_OK) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerPinOn = false;
+    buzzerActive = false;
+  }
+  xSemaphoreGive(buzzerMutex);
+}
+
+void waitForBuzzer() {
+  while (buzzerActive) {
+    delay(1);
+  }
+}
 
 //Functions
 void handleApplyTheme() {
@@ -310,16 +424,6 @@ void handlePressure() {
   server.send(200, "text/plain", String(currentPressure, 2));
 }
 
-void beepBuzzer(int times, int beepDuration, int pauseDuration) {
-
-  for (int i = 0; i < times; i++) {
-    digitalWrite(BUZZER_PIN, HIGH);  // Turn buzzer on
-    delay(beepDuration);
-    digitalWrite(BUZZER_PIN, LOW);   // Turn buzzer off
-    delay(pauseDuration);
-  }
-}
-
 void getCurrentTheme() {
 
     if (!SD.exists("/currentTheme.txt")) {
@@ -410,15 +514,18 @@ int basePumpPowerForSetpoint(double Pumpsetpoint) {
 
 void SetPump() {
 
-  // Only update after boost every xxx ms
-  if (millis() - DimlastUpdate > PRESS_INTERVAL) {
-    DimlastUpdate = millis();
+  unsigned long now = millis();
 
-    static int callCount = 0;
-    callCount++;
-    // Slow - adjust pump power every 50ms (per count)
-    if (callCount >= 4) {
-      callCount = 0;
+  // Only update after boost every xxx ms
+  if (now - DimlastUpdate > PRESS_INTERVAL) {
+    DimlastUpdate = now;
+
+    // Slow - adjust pump power every PUMP_ADJUST_INTERVAL of elapsed time,
+    // not every Nth call: the previous "every 4th qualifying call" counter
+    // only meant ~200ms when this function was entered at least every
+    // PRESS_INTERVAL, which isn't guaranteed under loop() load.
+    if (now - lastPumpAdjust >= PUMP_ADJUST_INTERVAL) {
+      lastPumpAdjust = now;
       if (currentPressure < PressureTarget - 0.2) { pumppower = constrain(pumppower + 1, 120, 255); }
       else if (currentPressure > PressureTarget + 0.2) { pumppower = constrain(pumppower - 2, 120, 255); }
     }
@@ -517,14 +624,18 @@ void setupServerRoutes() {
 }
 
 void startSD(){
+  // Called only from setup(), before loop() begins, so blocking here to keep
+  // the original boot-time beep timing is safe (nothing else needs to run
+  // concurrently yet).
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS)) {
     Serial.println("SD card initialization failed!");
-    beepBuzzer(3,1000,200);
+    queueBuzzer(3,1000,200);
   } else {
     Serial.println("SD card initialized.");
-    beepBuzzer(1,100,100);
+    queueBuzzer(1,100,100);
   }
+  waitForBuzzer();
 }
 
 void loadSDConfig() {
@@ -580,23 +691,27 @@ void startWiFi(){
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    beepBuzzer(5,1000,200);
+    queueBuzzer(5,1000,200);
     Serial.println("FAILED connecting to WiFi");
   } else {
-    beepBuzzer(1,500,100);
+    queueBuzzer(1,500,100);
     Serial.println("WiFi Connected!");
     WiFi.config(WiFi.localIP(), IPAddress(0,0,0,0), WiFi.subnetMask(), IPAddress(0,0,0,0));
     Serial.println("IP:  " + WiFi.localIP().toString());
     Serial.println("GW:  " + WiFi.gatewayIP().toString());
-    Serial.println("DNS: " + WiFi.dnsIP().toString());  
+    Serial.println("DNS: " + WiFi.dnsIP().toString());
   }
+  // Called only from setup(), before loop() begins; see startSD() note above.
+  waitForBuzzer();
 
 }
 
 void steam(){
 
   if (input > steamSetpoint - 5 && !steaming){
-    beepBuzzer(3,100,100);
+    // Called every loop() iteration; must not block control timing, so this
+    // only queues the pattern. The ESP timer service advances it.
+    queueBuzzer(3,100,100);
     steaming = true;
   }
   if (input < steamSetpoint - 20 && steaming){steaming = false;}
@@ -609,6 +724,10 @@ void setup() {
   delay(2000);
 
   pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  if (!initBuzzer()) {
+    Serial.println("Failed to initialize buzzer timer");
+  }
   
   //load config.json
   loadSDConfig();
@@ -656,7 +775,6 @@ void loop() {
   GetPressure();
   runPID();
   steam();
-
   // AC detection
   if (digitalRead(syncPin) == LOW && !acDetected && !PIDonly) {
     acDetectedTime = millis();
@@ -716,16 +834,36 @@ void loop() {
       else SetPump();
     }
 
-    // AC Turned off
-    if (digitalRead(syncPin) == HIGH) offcount++;
-    else offcount = 0;
+    // AC turned off: require both elapsed wall-clock time AND a minimum
+    // number of actually-observed HIGH samples before ending the shot.
+    // Time alone is not safe here: millis() keeps advancing even while
+    // loop() is stalled (SD/OTA paths are still blocking - see
+    // docs/PHASE1_NOTES.md), so a stall could let a single post-stall
+    // sample satisfy a pure time check and end a live shot. Requiring
+    // AC_OFF_MIN_SAMPLES real samples means a stall bookended by only one
+    // or two samples cannot trigger this on its own - loop() actually has
+    // to keep running and keep reading syncPin as HIGH throughout.
+    if (digitalRead(syncPin) == HIGH) {
+      if (!acOffPending) {
+        acOffPending = true;
+        acOffSince = millis();
+        acOffSamples = 0;
+      }
+      acOffSamples++;
+    } else {
+      acOffPending = false;
+      acOffSamples = 0;
+    }
 
-    if (offcount >= 100) {
+    if (acOffPending && acOffSamples >= AC_OFF_MIN_SAMPLES &&
+        millis() - acOffSince >= AC_OFF_DEBOUNCE_MS) {
       acDetected = false;
       shotStarted = false;
       pumpPowerSetPreinf = false;
       pumpPowerSetExtraction = false;
-      offcount = 0;
+      light.setBrightness(0);
+      acOffPending = false;
+      acOffSamples = 0;
     }
   }
 }

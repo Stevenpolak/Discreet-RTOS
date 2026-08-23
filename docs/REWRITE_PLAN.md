@@ -1,7 +1,7 @@
 # Two-task rewrite plan
 
-Status: planning  
-Current phase: Phase 0 — baseline and safety  
+Status: awaiting required hardware validation  
+Current phase: Phase 0/1 implementation complete, but their exit conditions are not met; do not start Phase 2 until the bench checklist below is recorded  
 Architecture target: one Arduino service loop plus one dedicated FreeRTOS control task
 
 This checklist is designed for work spread across multiple sessions. Finish and document one bounded step at a time; do not combine the architecture migration with unrelated behaviour changes.
@@ -15,7 +15,7 @@ Owns work that may be delayed briefly without affecting machine control:
 - Wi-Fi, mDNS and the web server
 - OTA handling
 - SD-card file management and uploads
-- Non-blocking buzzer sequencing
+- Timer-driven, non-blocking buzzer sequencing
 - Validation of requested setting changes
 - Sending commands/settings to the control task
 - Reading the latest immutable telemetry snapshot
@@ -98,26 +98,33 @@ Candidate fields include mode, shot state, temperature, pressure, elapsed shot t
 
 ### Phase 0 — Establish a safe baseline
 
-- [ ] Record the exact imported upstream commit/tag.
-- [ ] Build the current firmware unchanged.
-- [ ] Record ESP32 board/core version and all library versions.
-- [ ] Record pin mapping and hardware variants used for testing.
-- [ ] Document safe boot outputs: heater off and pump off until initialized.
-- [ ] Document fault behaviour for invalid temperature, invalid pressure, over-temperature, time-out and watchdog reset.
-- [ ] Create a baseline tag or branch.
-- [ ] Capture a short test record of current temp-only and normal-shot behaviour.
+- [x] Record the exact imported upstream commit/tag. See [BASELINE.md](BASELINE.md).
+- [x] Build the current firmware unchanged. Compiles cleanly against `esp32:esp32@2.0.17`; see [BASELINE.md](BASELINE.md).
+- [x] Record ESP32 board/core version and all library versions. See [BASELINE.md](BASELINE.md).
+- [ ] Record pin mapping and hardware variants used for testing. Pin mapping is documented in [BASELINE.md](BASELINE.md), but no physical test variant has been identified yet.
+- [x] Document safe boot outputs: heater off and pump off until initialized. Documented from source; **not yet bench-verified** — see [BASELINE.md](BASELINE.md) "Safe boot outputs".
+- [x] Document fault behaviour for invalid temperature, invalid pressure, over-temperature, time-out and watchdog reset. See [BASELINE.md](BASELINE.md) "Fault behaviour"; several gaps identified and carried forward, not fixed in Phase 0.
+- [x] Create a baseline tag or branch. Tag `baseline-phase0`.
+- [ ] Capture a short test record of current temp-only and normal-shot behaviour. **Not done** — no physical hardware was available in this environment. This remains open and must be completed on a bench before Phase 1+ firmware runs on real hardware.
 
-Exit condition: the unmodified baseline builds and its essential behaviour is recorded.
+Exit condition: **partially met**. The unmodified baseline builds and its essential behaviour is documented from source, but the bench test record is an open item, not a completed one — see [BASELINE.md](BASELINE.md) for the full list of open risks.
 
 ### Phase 1 — Remove blocking and loop-count timing
 
-- [ ] Replace buzzer delays with a timestamp-driven non-blocking sequencer.
-- [ ] Replace loop-count-based timing such as `offcount` with elapsed time or a timestamp derived from the relevant signal.
-- [ ] Audit web, SD and OTA paths for blocking calls that could affect migration.
-- [ ] Keep machine behaviour unchanged in this phase.
-- [ ] Re-run the baseline tests.
+- [x] Replace buzzer delays with a timer-driven non-blocking sequencer. See [PHASE1_NOTES.md](PHASE1_NOTES.md). Pattern edges are now driven by an ESP one-shot timer independent of `loop()`, so a blocking web/SD/OTA call can no longer stretch or hold a beep — closing a risk an earlier, simpler design could only document.
+- [x] Replace loop-count-based timing such as `offcount` with elapsed time or a timestamp derived from the relevant signal. See [PHASE1_NOTES.md](PHASE1_NOTES.md). An independent review caught a real regression in the first version (elapsed time alone let a `loop()` stall spuriously end a live shot); fixed by requiring a minimum observed-sample count alongside elapsed time. Also found and fixed the same defect in `SetPump()`'s `callCount`, which the original pass had missed. Debounce constants still need bench confirmation.
+- [x] Audit web, SD and OTA paths for blocking calls that could affect migration. See [PHASE1_NOTES.md](PHASE1_NOTES.md); documented, not changed — deferred to later phases.
+- [ ] Keep machine behaviour unchanged in this phase. The intended equivalence is documented in [PHASE1_NOTES.md](PHASE1_NOTES.md) "Behaviour-preservation checklist", with two small, deliberately-scoped exceptions (an explicit pump-off on shot-end, and the buzzer's edges no longer depending on loop latency) — but this cannot be checked off before bench confirmation. In particular, `AC_OFF_DEBOUNCE_MS`/`AC_OFF_MIN_SAMPLES` are judgement calls, not measured equivalents of the old 100-loop-iteration debounce.
+- [ ] Re-run the baseline tests. **Not done** — same hardware limitation as Phase 0.
 
-Exit condition: the current single-loop firmware remains functionally equivalent but no control behaviour depends on loop iteration speed.
+Exit condition: **implementation complete, not yet met overall**. Two rounds
+of independent review found and fixed a real regression (the AC-off
+debounce could be satisfied by a `loop()` stall) and a design gap (the
+buzzer could stick on during a stall); both are now fixed, and no control
+behaviour depends on loop iteration speed. Phase 2 still should not start
+until the Phase 0/1 bench checklist below is actually recorded: temp-only
+and normal-shot behaviour, safe-boot output measurement, buzzer sound
+check, and `AC_OFF_DEBOUNCE_MS`/`AC_OFF_MIN_SAMPLES` tuning.
 
 ### Phase 2 — Introduce explicit state and data models
 
@@ -249,3 +256,5 @@ Rules for incremental work:
 |---|---|---|---|---|
 | 2026-08-19 | Planning | Initial documentation | Two-task architecture and staged plan recorded | Start Phase 0 and capture the imported baseline |
 | 2026-08-19 | Planning | Documentation update | Added explicit Task WDT subscription, SSR deadman contract and latched mid-shot settings | Carry these contracts into Phase 0 safety criteria |
+| 2026-08-19 | Phase 0 + 1 | `phase0-1-baseline-and-deblocking`, see PR | Recorded imported commit (`b6ffbae`), pin mapping, safe-boot/fault-behaviour gaps and a `baseline-phase0` tag; confirmed the unmodified baseline only builds against `esp32:esp32@2.0.17` (3.x breaks `dimmable_light`'s timer API usage). Replaced the blocking buzzer and the loop-count `offcount` shot-end debounce with non-blocking/timestamp-driven equivalents; audited remaining blocking calls in web/SD/OTA paths and documented rather than changed them. Both baseline and modified firmware compile cleanly. **No physical hardware was available in this environment**, so the bench test record (temp-only and normal-shot behaviour, safe-boot measurement, `AC_OFF_DEBOUNCE_MS` validation) is an open item, not completed. | Bench-verify this PR's behaviour-preservation claims on real hardware, then start Phase 2 (explicit `OperatingMode`/`ShotState`/settings structs) |
+| 2026-08-19 | Phase 0 + 1 review fixes | `phase0-1-baseline-and-deblocking`, see PR | Two independent review efforts landed on this branch and were merged together. One (7-angle model review, verified) found a real regression: the elapsed-time-only AC-off debounce could be satisfied by one sample right after a `loop()` stall, spuriously ending a live shot and restarting it at full pump power; fixed by also requiring a minimum count of actually-observed samples, by explicitly zeroing the pump on shot-end, and by fixing the same loop-count-timing defect in `SetPump()`'s `callCount` (missed by the original Phase 1 pass). The other moved the buzzer's pattern edges onto an ESP one-shot timer independent of `loop()`, closing the "a blocking web/SD/OTA call can stretch or hold a beep" risk that the first pass could only document; it also corrected the actuator-ownership baseline (`/adjust`'s legacy `Pause`/`Resume` write the pump directly) and expanded the blocking-call audit table. Firmware compiles cleanly after merging both. Full detail in `PHASE1_NOTES.md` "Review round 1". | Get sign-off on the merged state, then bench-test temp-only and a normal shot, measure safe boot outputs, verify buzzer patterns, and tune `AC_OFF_DEBOUNCE_MS`/`AC_OFF_MIN_SAMPLES` before starting Phase 2 |
