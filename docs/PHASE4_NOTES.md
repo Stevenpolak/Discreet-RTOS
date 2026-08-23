@@ -152,17 +152,20 @@ explicit, not accidental, boundary
 
 ## Build verification
 
-Compiled with the same toolchain as Phase 0-3 (`esp32:esp32@2.0.17`):
+Compiled with the same toolchain as Phase 0-3 (`esp32:esp32@2.0.17`), after
+the review-round-1 fixes below:
 
 ```
-Sketch uses 906661 bytes (69%) of program storage space. Maximum is 1310720 bytes.
+Sketch uses 906733 bytes (69%) of program storage space. Maximum is 1310720 bytes.
 Global variables use 51292 bytes (15%) of dynamic memory, leaving 276388 bytes for local variables. Maximum is 327680 bytes.
 ```
 
-No compiler errors or warnings. +1040 bytes flash / +8 bytes RAM versus the
+No compiler errors or warnings. +1112 bytes flash / +8 bytes RAM versus the
 merged Phase 0-3 state (`v2.0.2-beta`: 905,621 bytes flash, 51,284 bytes
-RAM) - the two `xQueueCreate()`-backed queues plus the two new
-`ControlCommand` fields and four new `TelemetrySnapshot` fields.
+RAM) - the two `xQueueCreate()`-backed queues, the two new `ControlCommand`
+fields, four new `TelemetrySnapshot` fields, the `sendControlCommand()`
+helper / `endShot()` call added in review, net of the code-size drop from
+no longer calling `millis()` inside `buildTelemetrySnapshot()`.
 
 ## Behaviour-preservation checklist
 
@@ -183,7 +186,8 @@ RAM) - the two `xQueueCreate()`-backed queues plus the two new
       burst deeper than `COMMAND_QUEUE_DEPTH` = 8 queued-but-undrained
       commands - not reachable in practice given the drain happens every
       `loop()` iteration, but a real, testable behaviour change from the
-      old handler, which never rejected a request).
+      old handler, which never rejected a request). `/saveConfig` gained
+      the same failure mode in review round 1 - see below.
 - [ ] Bench re-test still required, same hardware limitation as every
       prior phase. This phase adds: confirm `/adjust` edits still apply
       with no perceptible added latency; confirm `/saveConfig`'s setpoint
@@ -191,4 +195,120 @@ RAM) - the two `xQueueCreate()`-backed queues plus the two new
       `/getValues` still reflects reality throughout a shot, a fault, and
       a mode change; attempt a rapid-fire `/adjust` burst and confirm
       either normal application or an explicit `503`, never a silently
-      dropped edit.
+      dropped edit; confirm flipping to temp-only mid-shot now ends the
+      shot outright (matching a fault) rather than just masking the pump
+      for as long as the mode stays flipped.
+
+## Review round 1: findings and fixes
+
+Same independent multi-angle review as every prior phase. One gap was
+already self-identified while writing the review prompts (the
+`/saveConfig` `xQueueSend()` return-value gap below); the review
+independently confirmed it from four separate angles and surfaced two more
+real, safety-relevant issues.
+
+### Fixed
+
+1. **`/saveConfig` never checked `xQueueSend()`'s return value.** Both the
+   setpoint and mode commands were sent with `if (commandQueue != nullptr)
+   xQueueSend(...)`, discarding the result, and the handler always answered
+   `200 "Saved"`. Because `/saveConfig` writes `config.json` to SD *before*
+   queuing either command, a full or uncreated `commandQueue` meant the
+   persisted file and the running machine could disagree - silently, with
+   no client-visible signal - until the next reboot. `handleAdjust()`
+   already had the correct pattern (503 on failure); `/saveConfig` didn't.
+   Fixed by extracting `sendControlCommand()` - a single `commandQueue !=
+   nullptr && xQueueSend(..., 0) == pdTRUE` check both handlers now share -
+   and having `/saveConfig` answer `503` if either send fails, matching
+   `handleAdjust()`. See `sendControlCommand()` and both call sites.
+
+2. **A mode change to temp-only mid-shot masked the pump's output but never
+   ended the shot**, unlike a fault. `controlStep()`'s output-priority
+   resolution already forced `pumpOut = 0` while `currentMode ==
+   TEMP_ONLY`, but the shot-phase branches earlier in the same function
+   kept running underneath that mask - with the pump not actually turning,
+   `currentPressure` reads low, which re-arms `pumppower = 255` on the next
+   cycle. The moment the mode flipped back to `NORMAL` mid-shot, the pump
+   would slam to whatever wound up under the mask. This is the same
+   masked-output windup/slam bug Phase 3's review found and fixed for
+   faults via `endShot()` - `SET_MODE` is a new path into that same
+   priority-resolution code this phase adds, and needed the same fix.
+   Fixed by calling `endShot()` alongside the existing `pumpOut = 0` when
+   `currentMode == TEMP_ONLY` and `acDetected`, mirroring the fault
+   handling immediately above it in `controlStep()`.
+
+3. **`SET_BREW_SETPOINT_ABSOLUTE` had no `constrain()`**, unlike every
+   other setpoint-bearing case in `applyControlCommand()`'s switch. This
+   matched `/saveConfig`'s pre-existing behaviour (never range-checked
+   before this phase either), but this phase is what routes it through
+   `applyControlCommand()` and checks off REWRITE_PLAN.md's "reject unsafe
+   or invalid settings inside the control owner" - the one command type
+   that newly reaches the control owner was also the one left unvalidated.
+   A client posting `{"setpoint": 500}` to `/saveConfig` would have set an
+   unbounded heater target with no PID-side ceiling. Fixed by clamping to
+   the same `10 + offset .. 96 + offset` range `SET_BREW_SETPOINT` uses.
+
+4. **`buildTelemetrySnapshot()` called `millis()` itself** instead of
+   taking `now` as a parameter, even though its only hot-path caller
+   (`controlStep()`) already samples `now` at the top of the function for
+   exactly this purpose - and `controlStep()`'s own doc comment already
+   states that convention. The efficiency angle measured `millis()` on this
+   target as a ~250-400 cycle call (a real hardware-timer read plus a
+   software 64-bit divide, there being no hardware 64-bit divide on the
+   LX6 core), making it the single largest new per-cycle cost this phase
+   added - larger than either new queue operation. Fixed by giving
+   `buildTelemetrySnapshot()` a `now` parameter; `controlStep()` passes the
+   `now` it already has, and `handleGetValues()`'s direct-build fallback
+   (which has no `now` of its own) passes `millis()` explicitly, so its
+   behaviour is unchanged.
+
+### Considered, not changed - would trade correctness for throughput
+
+- **Gating the telemetry publish to a periodic interval** (matching
+  `GetPressure()`'s `PRESS_INTERVAL` gate) instead of publishing every
+  cycle would remove most of the remaining new per-cycle cost (an
+  `xQueueReceive` on an empty queue, plus the `xQueueOverwrite`'s critical
+  section - together on the order of 1-2 µs, small enough at 240 MHz to be
+  a rounding error next to `server.handleClient()`/`ArduinoOTA.handle()`'s
+  tens-of-µs socket polls, but real). Not done: `resolvedHeaterOn`/
+  `resolvedPumpPower` are specifically published *every* cycle, right after
+  the actuator writes, so a bench operator watching telemetry sees a fault
+  or mode restriction take effect on the same cycle it happens - gating the
+  publish would reintroduce exactly the staleness Phase 3's review added
+  those two fields to eliminate. A throughput win here isn't worth trading
+  away.
+
+### Documented, not fixed - deliberately out of this phase's scope
+
+- **The front end doesn't check the HTTP response status.**
+  `Discreet_Front_End/scripts.js`'s `adjust()` and `config.js`'s save
+  handler both proceed unconditionally after `fetch()` resolves, so the
+  `503` this phase added (and just extended to `/saveConfig`) is invisible
+  in the UI - a rejected edit looks identical to an accepted one. Real, but
+  front-end behaviour is outside this phase's stated scope (queue
+  plumbing on the firmware side); left as a known gap for whichever phase
+  next touches the front end, rather than changing UI code inside a
+  backend-plumbing PR.
+- **A few more control-relevant globals are still read directly from
+  HTTP-handler context** beyond the `Kp`/`Ki`/`Kd`/`offset`/`steamSetpoint`/
+  `actime`/`brewTemp` exceptions §4 already names: `handleTemp()` reads the
+  live `setpoint` global directly (one of the exact globals `handleGetValues()`
+  no longer touches), and `offset` doubles as the safety clamp bound at the
+  `constrain()` calls in `applyControlCommand()` in addition to being a
+  display-only adjustment - both pre-existing, both single-task-safe today,
+  both worth re-examining once Phase 5 makes these genuinely concurrent
+  reads. The REWRITE_PLAN.md "confirm no shared mutable control globals
+  remain" checkbox is left checked with this note added rather than
+  unchecked, since the phase's actual scope (getting settings/mode edits
+  and telemetry off direct handler access) is met - these are narrower,
+  pre-existing residuals, not something this phase reintroduced.
+- **`/saveConfig`'s SD write and its two queued commands are not atomic.**
+  The file write happens first and always completes; the setpoint and mode
+  commands are then two independent `xQueueSend()` calls, so it's possible
+  (though not reachable today given the queue is drained every `loop()`
+  iteration and can only ever hold at most 2 pending commands from this
+  handler) for one to succeed and the other to fail. Not fixed here -
+  making config persistence and control-state application a single atomic
+  step is a larger redesign than this phase's "route existing writes
+  through a queue" scope, and is better addressed once Phase 5's real task
+  split forces a decision about config persistence ownership anyway.

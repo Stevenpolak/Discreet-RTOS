@@ -273,7 +273,14 @@ struct TelemetrySnapshot {
 // reader always gets the latest complete snapshot, never a partial one.
 QueueHandle_t telemetryQueue = nullptr;
 
-TelemetrySnapshot buildTelemetrySnapshot() {
+// Takes `now` rather than calling millis() itself - found in review (Phase
+// 4 efficiency angle): this is called once per controlStep() cycle, which
+// already samples `now` at the top of that function for exactly this kind
+// of use; millis() itself is a ~250-400 cycle 64-bit-divide-backed call on
+// this target; TelemetrySnapshot's only other caller (handleGetValues()'s
+// direct-build fallback) doesn't have a `now` to reuse and passes millis()
+// explicitly instead.
+TelemetrySnapshot buildTelemetrySnapshot(unsigned long now) {
   TelemetrySnapshot snap;
   snap.mode = currentMode;
   snap.shotState = currentShotState;
@@ -287,7 +294,7 @@ TelemetrySnapshot buildTelemetrySnapshot() {
   snap.activeSettingsRevision = activeSettings.revision;
   snap.shotSettingsRevision = shotSettings.revision;
   snap.pendingSettingsRevision = pendingSettings.revision;
-  snap.timestampMs = millis();
+  snap.timestampMs = now;
   // displaySetpoint: while steamRequested, the live PID target is
   // steamSetpoint, not the (unrelated) brew target in pendingSettings -
   // matches /temp and the chart during steam, same resolution
@@ -415,11 +422,12 @@ bool applyControlCommand(const ControlCommand& cmd) {
       return true;
     case ControlCommand::Type::SET_BREW_SETPOINT_ABSOLUTE:
       // From /saveConfig, which posts a complete target rather than a
-      // delta. No constrain() here, matching /saveConfig's pre-existing
-      // behaviour (unlike /adjust's SET_BREW_SETPOINT, this was never
-      // range-checked - a pre-existing gap, not something this phase set
-      // out to fix).
-      acceptBrewSetpointEdit(cmd.value);
+      // delta. /saveConfig's pre-existing behaviour never range-checked
+      // this value; now that it's routed through the control owner (the
+      // one place REWRITE_PLAN.md's "reject unsafe or invalid settings"
+      // item designates for that), clamp it the same as SET_BREW_SETPOINT
+      // so an absolute edit can't push the heater target arbitrarily high.
+      acceptBrewSetpointEdit(constrain(cmd.value, 10 + offset, 96 + offset));
       return true;
     case ControlCommand::Type::SET_MODE:
       // Keeps the legacy PIDonly mirror in sync, same as loadSDConfig()/
@@ -431,6 +439,19 @@ bool applyControlCommand(const ControlCommand& cmd) {
     default:
       return false;
   }
+}
+
+// Single entry point for handing a command to commandQueue: null-checks the
+// queue and reports whether the send actually succeeded, so every call site
+// - handleAdjust() and /saveConfig alike - can react to a full/uncreated
+// queue instead of silently discarding it. Found in review (Phase 4):
+// handleAdjust() checked this itself and returned 503 on failure, but
+// /saveConfig's two xQueueSend() calls did not, so a full or uncreated
+// queue there let /saveConfig write the new setpoint/mode to config.json,
+// drop both commands, and still answer "Saved" - the persisted config and
+// the running machine would then disagree until the next reboot.
+bool sendControlCommand(const ControlCommand& cmd) {
+  return commandQueue != nullptr && xQueueSend(commandQueue, &cmd, 0) == pdTRUE;
 }
 
 DimmableLight light(thyristorPin);
@@ -694,7 +715,7 @@ void handleAdjust() {
     server.send(200, "text/plain", "OK");
     return;
   }
-  if (commandQueue != nullptr && xQueueSend(commandQueue, &cmd, 0) == pdTRUE) {
+  if (sendControlCommand(cmd)) {
     server.send(200, "text/plain", "OK");
   } else {
     server.send(503, "text/plain", "Busy, try again");
@@ -735,7 +756,7 @@ void handleGetValues() {
   // controlStep() has run even once, or queue creation failed in setup()).
   TelemetrySnapshot snap;
   if (telemetryQueue == nullptr || xQueuePeek(telemetryQueue, &snap, 0) != pdTRUE) {
-    snap = buildTelemetrySnapshot();
+    snap = buildTelemetrySnapshot(millis());
   }
 
   StaticJsonDocument<384> doc;
@@ -1000,7 +1021,7 @@ void setupServerRoutes() {
     ControlCommand setpointCmd;
     setpointCmd.type = ControlCommand::Type::SET_BREW_SETPOINT_ABSOLUTE;
     setpointCmd.value = (doc["setpoint"] | (pendingSettings.setpoint - offset)) + offset;
-    if (commandQueue != nullptr) xQueueSend(commandQueue, &setpointCmd, 0);
+    bool setpointSent = sendControlCommand(setpointCmd);
 
     steamSetpoint = (doc["steamSetpoint"] | steamSetpoint) + offset;
 
@@ -1013,12 +1034,25 @@ void setupServerRoutes() {
     ControlCommand modeCmd;
     modeCmd.type = ControlCommand::Type::SET_MODE;
     modeCmd.mode = (doc["PIDonly"] | PIDonly) ? OperatingMode::TEMP_ONLY : OperatingMode::NORMAL;
-    if (commandQueue != nullptr) xQueueSend(commandQueue, &modeCmd, 0);
+    bool modeSent = sendControlCommand(modeCmd);
 
     Serial.println("Config saved");
-  
-    server.send(200, "text/plain", "Saved");
-  
+
+    // Found in review (Phase 4): the SD write above already committed the
+    // new config.json by this point (config.json is a separate, unqueued
+    // persistence path this phase doesn't change - see PHASE4_NOTES.md),
+    // but the in-memory setpoint/mode only take effect if both sends above
+    // actually succeeded. Report a failure here rather than answering
+    // "Saved" when the running machine and the file it just wrote can
+    // disagree - the same 503-on-full-queue behaviour handleAdjust() already
+    // has, extended to the one handler that previously had no way to signal
+    // it at all.
+    if (setpointSent && modeSent) {
+      server.send(200, "text/plain", "Saved");
+    } else {
+      server.send(503, "text/plain", "Saved to file, but busy - setpoint/mode not applied yet, try again");
+    }
+
   });
 
   server.on("/applyTheme", HTTP_GET, handleApplyTheme);
@@ -1433,8 +1467,20 @@ void controlStep(unsigned long now) {
   // found in review that the first version of this check read PIDonly
   // directly, which would have silently stopped enforcing this restriction
   // the moment anything set currentMode without also setting PIDonly.
+  //
+  // A mode flip mid-shot also needs the shot itself ended, not just this
+  // cycle's pump output masked - found in review (Phase 4): SET_MODE
+  // reaches here through the queue-drain loop above, so the shot-phase
+  // branches earlier in this same function already ran and can keep
+  // updating pumpDemand every cycle the mask stays up (e.g. currentPressure
+  // reads low with no pump running, so the branch re-arms pumppower = 255).
+  // Without calling endShot(), the moment the mode flips back to NORMAL
+  // mid-shot the pump slams to whatever wound up underneath the mask -
+  // the exact masked-output windup/slam bug Phase 3's review fixed for
+  // faults via endShot(); this is the same fix for the new SET_MODE path.
   if (currentMode == OperatingMode::TEMP_ONLY) {
     pumpOut = 0;
+    if (acDetected) endShot();
   }
 
   // 3. Whatever remains is the state-machine demand, already resolved
@@ -1459,7 +1505,7 @@ void controlStep(unsigned long now) {
   // buildTelemetrySnapshot()) reflect what was actually just written, not
   // the previous cycle's values.
   if (telemetryQueue != nullptr) {
-    TelemetrySnapshot snap = buildTelemetrySnapshot();
+    TelemetrySnapshot snap = buildTelemetrySnapshot(now);
     xQueueOverwrite(telemetryQueue, &snap);
   }
 
