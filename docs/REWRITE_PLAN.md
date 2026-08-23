@@ -1,7 +1,7 @@
 # Two-task rewrite plan
 
 Status: awaiting required hardware validation  
-Current phase: Phase 0/1 implementation complete, but their exit conditions are not met; do not start Phase 2 until the bench checklist below is recorded  
+Current phase: Phase 0/1/2 implementation complete at the code level; none of their exit conditions are bench-verified yet - see docs/BASELINE.md and docs/PHASE1_NOTES.md and docs/PHASE2_NOTES.md for the outstanding bench checklists before Phase 3  
 Architecture target: one Arduino service loop plus one dedicated FreeRTOS control task
 
 This checklist is designed for work spread across multiple sessions. Finish and document one bounded step at a time; do not combine the architecture migration with unrelated behaviour changes.
@@ -128,17 +128,35 @@ check, and `AC_OFF_DEBOUNCE_MS`/`AC_OFF_MIN_SAMPLES` tuning.
 
 ### Phase 2 — Introduce explicit state and data models
 
-- [ ] Add `OperatingMode` with at least normal brew and temp-only.
-- [ ] Add `ShotState`: `IDLE`, `PREINFUSION`, `BLOOM`, `EXTRACTION`, `COMPLETE`, `FAULT`.
-- [ ] Remove Pause/Resume endpoints, variables and UI assumptions.
-- [ ] Define value-only `ControlSettings`, `ControlCommand` and `TelemetrySnapshot` structs.
-- [ ] Define allowed state transitions and entry/exit actions.
-- [ ] Define settings ranges, units and revision handling.
-- [ ] Define `activeSettings`, immutable per-shot `shotSettings` and latest-value `pendingSettings`.
-- [ ] Define the atomic `pendingSettings -> activeSettings` promotion on return to `IDLE`.
-- [ ] Add human-readable fault codes.
+**Started ahead of the Phase 0/1 bench checklist being recorded, on
+explicit direction.** Per this document's own rule 4 ("do not start a
+phase until the previous exit condition is met or the exception is written
+down"), that exception is: no physical hardware has been available in any
+session so far, the bench items were already blocked before this phase
+started, and Phase 2 is pure code/data-model structure that does not touch
+timing-sensitive or actuator-priority behaviour beyond what's noted below -
+judged low-risk enough to proceed with in software while the bench
+checklist remains outstanding. It does not reduce the need to complete
+that checklist before any of this runs on real hardware.
 
-Exit condition: modes, states, settings, commands and telemetry have explicit definitions without yet requiring a second task.
+- [x] Add `OperatingMode` with at least normal brew and temp-only. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §1 - kept as a mirror of the existing `PIDonly` bool rather than replacing it, to avoid auditing every `PIDonly` read without hardware to verify against.
+- [x] Add `ShotState`: `IDLE`, `PREINFUSION`, `BLOOM`, `EXTRACTION`, `COMPLETE`, `FAULT`. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §1-2. `FAULT` priority is observability-only in this phase - it does not yet override actuator outputs; see the explicit scope note in §2.
+- [x] Remove Pause/Resume endpoints, variables and UI assumptions. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §3. No UI assumption existed to remove (checked the SD-card front-end archive).
+- [x] Define value-only `ControlSettings`, `ControlCommand` and `TelemetrySnapshot` structs. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §4 - all three are actually used (`ControlCommand` by `handleAdjust()`, `TelemetrySnapshot` by `handleGetValues()`), not just defined.
+- [x] Define allowed state transitions and entry/exit actions. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §1, §5 - shot-start and shot-end entry actions (settings latch/promotion, brew-setpoint mirror) are implemented; transitions are labels on the existing, unchanged phase conditions.
+- [x] Define settings ranges, units and revision handling. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §4-5 - ranges match the original `constrain()` calls; each `ControlSettings` instance carries a revision counter.
+- [x] Define `activeSettings`, immutable per-shot `shotSettings` and latest-value `pendingSettings`. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §5.
+- [x] Define the atomic `pendingSettings -> activeSettings` promotion on return to `IDLE`. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §5. This is a genuine, intentional behaviour change (mid-shot edits no longer take effect immediately) - explicitly scoped here by this document's own "Settings lifecycle" section.
+- [x] Add human-readable fault codes. See [PHASE2_NOTES.md](PHASE2_NOTES.md) §1 - `toString()` for all three new enums, not just `FaultCode`.
+
+Exit condition: **met at the code/data-model level** - modes, states,
+settings, commands and telemetry have explicit definitions, still running
+synchronously inside the single `loop()` with no second task. Not yet
+bench-verified (same outstanding item as Phase 0/1); see
+[PHASE2_NOTES.md](PHASE2_NOTES.md) "Behaviour-preservation checklist" for
+what specifically still needs a bench pass, including the two intentional
+behaviour changes this phase introduces (settings latch, Pause/Resume
+removal).
 
 ### Phase 3 — Centralize control ownership
 
@@ -258,3 +276,5 @@ Rules for incremental work:
 | 2026-08-19 | Planning | Documentation update | Added explicit Task WDT subscription, SSR deadman contract and latched mid-shot settings | Carry these contracts into Phase 0 safety criteria |
 | 2026-08-19 | Phase 0 + 1 | `phase0-1-baseline-and-deblocking`, see PR | Recorded imported commit (`b6ffbae`), pin mapping, safe-boot/fault-behaviour gaps and a `baseline-phase0` tag; confirmed the unmodified baseline only builds against `esp32:esp32@2.0.17` (3.x breaks `dimmable_light`'s timer API usage). Replaced the blocking buzzer and the loop-count `offcount` shot-end debounce with non-blocking/timestamp-driven equivalents; audited remaining blocking calls in web/SD/OTA paths and documented rather than changed them. Both baseline and modified firmware compile cleanly. **No physical hardware was available in this environment**, so the bench test record (temp-only and normal-shot behaviour, safe-boot measurement, `AC_OFF_DEBOUNCE_MS` validation) is an open item, not completed. | Bench-verify this PR's behaviour-preservation claims on real hardware, then start Phase 2 (explicit `OperatingMode`/`ShotState`/settings structs) |
 | 2026-08-19 | Phase 0 + 1 review fixes | `phase0-1-baseline-and-deblocking`, see PR | Two independent review efforts landed on this branch and were merged together. One (7-angle model review, verified) found a real regression: the elapsed-time-only AC-off debounce could be satisfied by one sample right after a `loop()` stall, spuriously ending a live shot and restarting it at full pump power; fixed by also requiring a minimum count of actually-observed samples, by explicitly zeroing the pump on shot-end, and by fixing the same loop-count-timing defect in `SetPump()`'s `callCount` (missed by the original Phase 1 pass). The other moved the buzzer's pattern edges onto an ESP one-shot timer independent of `loop()`, closing the "a blocking web/SD/OTA call can stretch or hold a beep" risk that the first pass could only document; it also corrected the actuator-ownership baseline (`/adjust`'s legacy `Pause`/`Resume` write the pump directly) and expanded the blocking-call audit table. Firmware compiles cleanly after merging both. Full detail in `PHASE1_NOTES.md` "Review round 1". | Get sign-off on the merged state, then bench-test temp-only and a normal shot, measure safe boot outputs, verify buzzer patterns, and tune `AC_OFF_DEBOUNCE_MS`/`AC_OFF_MIN_SAMPLES` before starting Phase 2 |
+| 2026-08-23 | Phase 0 + 1 tagged, merged | `main`, tag `v2.0.0-alpha` | PR merged to `main` after the review fixes above; tagged and published as a pre-release with notes framing it as the first of several rewrite waves. Bench checklist still outstanding at this point. | Bench-test before Phase 2, or proceed with Phase 2 code/data-model work in parallel per explicit direction (see next row) |
+| 2026-08-23 | Phase 2 | `phase2-state-and-data-models`, see PR | Started ahead of the outstanding bench checklist, on explicit direction (see the exception note under Phase 2 above). Added `OperatingMode`/`ShotState`/`FaultCode` enums with `toString()`; `ControlSettings`/`ControlCommand`/`TelemetrySnapshot` value-only structs, all three actually used (not just defined); the `activeSettings`/`shotSettings`/`pendingSettings` latch-and-promote lifecycle for brew setpoint, pressure target and phase durations (a genuine, intentionally-scoped behaviour change - mid-shot edits no longer take effect until the shot returns to `IDLE`); removed Pause/Resume (no UI referenced it). `FAULT` state is observability-only in this phase - it does not yet override actuator outputs, which stays Phase 3's job. Found and fixed a narrow pre-existing `setpoint`/`setpointBoot` offset inconsistency while consolidating them. Also found that the new code broke Arduino's automatic function-prototype generation for the rest of the file; fixed with explicit forward declarations. Compiles cleanly: 905,149 bytes flash (+1,516 vs `v2.0.0-alpha`), 51,260 bytes RAM (+48). Full detail in `PHASE2_NOTES.md`. | Independent model review of this PR, then bench-test everything still outstanding from Phase 0/1/2 before Phase 3 |
