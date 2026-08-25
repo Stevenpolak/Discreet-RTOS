@@ -246,6 +246,16 @@ Exit condition: the SSR uses the available PID resolution (bounded by `SSR_ENFOR
 
 ### Phase 7 — Verification
 
+A code-level verification pass against every item below - what the code
+actually guarantees vs. what still needs a real machine - is recorded in
+`docs/PHASE7_NOTES.md`, including two real gaps it found (no invalid-
+pressure-sensor detection; no independent deadman for the pump, unlike the
+heater's since Phase 6). Checkboxes below stay unchecked: this phase's exit
+condition requires bench results this environment cannot produce, and code-
+level verification is not a substitute for it - see `PHASE7_NOTES.md` for
+which items are logic-guaranteed today and exactly what to run on real
+hardware to close out each one.
+
 - [ ] Temp-only heats and regulates temperature while shot logic and pump remain inactive.
 - [ ] Normal shot detection enters and exits every intended phase correctly.
 - [ ] Pre-infusion, bloom and extraction timing use wall-clock time.
