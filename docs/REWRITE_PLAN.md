@@ -274,6 +274,45 @@ Exit condition: the hardware/bench checklist passes and results are recorded.
 - [ ] Update this checklist and the root README.
 - [ ] Decide whether changes should be proposed upstream as one or several focused pull requests.
 
+### Phase 9 — Physical controls: power/sleep, steam button, status LEDs
+
+Net-new functionality, not part of the task-migration architecture itself - sequenced after Phase 7/8 because it's built on top of `OperatingMode`/`ControlCommand`/`controlStep()`'s priority-resolution chain and should land on a verified base, not a moving one. Two physical momentary buttons and two status LEDs:
+
+```
+#define SLEEP_BUTTON_PIN 27  // toggles a new OFF state
+#define STEAM_BUTTON_PIN 14  // toggles steam mode, mirrors the existing web START_STEAM/STOP_STEAM path
+#define POWER_LED_PIN    16  // solid=awake, pulsing=asleep, off=OFF - PENDING PSRAM CHECK, see below
+#define STEAM_LED_PIN    17  // reflects steamRequested - PENDING PSRAM CHECK, see below
+```
+
+**Hardware pre-check, before wiring anything:** confirm whether the physical ESP32 module has PSRAM (WROVER-class). If it does, GPIO16/17 are wired internally to the PSRAM chip and unusable for anything else - fall back to GPIO2 and GPIO15 for the two LEDs instead (both are boot-strapping pins, but low-risk for an LED specifically: a current-limited LED load doesn't typically violate strapping requirements the way a button input or an actuator sharing the same pin could, and a brief flash at boot is cosmetic, not functional - still worth a bench check at boot before trusting it). GPIO27/14 (the buttons) have no such caveat and are confirmed free against every pin this project already uses (SSR 13, dimmer 18, sync 19, thermocouple 21/22/23, SD 25/26/32/33, pressure 34, buzzer 4). GPIO14 is one of the four JTAG pins (MTMS) - harmless for a plain debounced input with JTAG unused, the same category of caveat this project already lives with on GPIO13 (SSR, MTCK).
+
+**Design, confirmed with the user before drafting this checklist:**
+- A new `PowerState` enum (`AWAKE`/`SLEEPING`/`OFF`), independent of `OperatingMode` - power/attentiveness is a different axis from brew-mode.
+- **OFF** and **SLEEP** are two distinct states, not the same state reached two ways. `SLEEP_BUTTON_PIN` toggles `OFF` directly (manual only - press to fully disable, press again to wake straight to `AWAKE`); a 30-minute idle timeout is the *only* path into `SLEEPING`. `OFF` forces the heater and pump off through the same priority-resolution chain `faulted`/`otaInProgress` already use (Phase 3/6), and also suppresses AC-detect/shot-start the same way `TEMP_ONLY` already does, so pulling the lever while off doesn't try to start a shot underneath a forced-off heater. WiFi/web server/OTA stay up throughout - "keeps the board alive" per the original ask.
+- **SLEEP** (auto, 30 min idle) does not disable the control loop - it changes the target: setpoint falls back to 55°C (offset-adjusted, same representation `setpoint` already uses) and steam mode is turned off if active, using the exact same setpoint-swap shape `START_STEAM`/`STOP_STEAM` already have in `applyControlCommand()`. The PID keeps running normally at the new, lower target - this is a standby setback, not a shutdown.
+- **Idle timer reset**: any interaction counts, not just physical buttons - web `/adjust`, `/saveConfig`, and steam start/stop all reset it too. Free to implement with zero new plumbing: `applyControlCommand()` is already the single point every one of those passes through (Phase 4's "control owner" design), so it can update `lastActivityMs` once, centrally, rather than needing every caller to remember to.
+- **Wake trigger**: physical buttons only (`SLEEP_BUTTON_PIN` or `STEAM_BUTTON_PIN`) - a touch on either restores `setpoint` to `activeSettings.setpoint` (the last real brew target, not a hardcoded value) and returns to `AWAKE`. A web/app command arriving while asleep does not itself wake the machine.
+- LED pulsing ("MacBook-style breathing") driven from the existing 10ms control cycle via LEDC PWM, not a separate timer/task - cosmetic, not safety-critical, so (unlike the Phase 6 SSR deadman) there's no reason to pay for independence from `controlTask`'s own health.
+
+**Checklist:**
+
+- [ ] Confirm PSRAM presence on the actual board; finalize LED pin assignment (16/17, or the GPIO2/15 fallback) before wiring.
+- [ ] Add `PowerState` (`AWAKE`/`SLEEPING`/`OFF`) as a new enum, and a global tracking it, alongside the existing `OperatingMode`/`ShotState`/`FaultCode` enums.
+- [ ] Read `SLEEP_BUTTON_PIN`/`STEAM_BUTTON_PIN` inside `controlStep()`, next to the existing `syncPin` read - not through `commandQueue` (they're not HTTP-originated). Debounce with the same edge-triggered, multi-consistent-sample idiom `AC_OFF_MIN_SAMPLES`/`AC_OFF_DEBOUNCE_MS` already establish, not a new pattern; mark the debounce constants `TODO(bench)` like every other timing constant in this file.
+- [ ] `SLEEP_BUTTON_PIN` toggles `PowerState` between `OFF` and `AWAKE` directly (an edge-triggered action, once per physical press, never through `SLEEPING`).
+- [ ] `STEAM_BUTTON_PIN` toggles steam mode by constructing the same `START_STEAM`/`STOP_STEAM` `ControlCommand` the web UI's `/adjust` already sends - reuse the existing command, don't add a parallel path into `steamRequested`.
+- [ ] Extend `controlStep()`'s fault-priority resolution (where `faulted`/`otaInProgress` already force `heaterOut`/`pumpOut` off) to also force off when `powerState == PowerState::OFF`.
+- [ ] Extend the AC-detect gate (currently `currentMode != OperatingMode::TEMP_ONLY`) to also require `powerState != PowerState::OFF`, so a shot can't start while off.
+- [ ] `lastActivityMs`, updated once inside `applyControlCommand()` (covers every web-originated command) and once on each physical button press; a 30-minute-elapsed check inside `controlStep()` transitions `AWAKE → SLEEPING` when idle, using the setpoint-swap shape described above.
+- [ ] Either physical button, while `SLEEPING`, transitions back to `AWAKE`: restore `setpoint` from `activeSettings.setpoint`, reset `lastActivityMs`.
+- [ ] `POWER_LED_PIN`: solid while `AWAKE`, breathing-pulse (LEDC PWM, smooth duty ramp over roughly a 2-3s period - `TODO(bench)` for the exact feel) while `SLEEPING`, off while `OFF`.
+- [ ] `STEAM_LED_PIN`: reflects `steamRequested`. Open refinement to confirm with the user, not assumed: blink while warming up (`steamRequested` true, `steaming` still false) and go solid once actually at temperature (`steaming` true) - mirrors the existing buzzer "steam ready" cue - versus a plain on/off tied only to `steamRequested`.
+- [ ] Decide and document whether `OFF` survives a reboot/power cycle, or the machine always comes back `AWAKE` after power is restored - not resolved yet, worth a deliberate answer rather than an accidental default.
+- [ ] Bench-test debounce behaviour, LED pulse feel, and the full state graph (`AWAKE → SLEEPING → AWAKE`, `AWAKE → OFF → AWAKE`, and that `OFF` cannot be entered from `SLEEPING` by anything other than the explicit button toggle) on real hardware.
+
+Exit condition: both buttons are debounced and reliable, `OFF` fully disables actuators and shot-start while keeping the board reachable over WiFi, the 30-minute idle setback and physical-button wake behave as specified, and both LEDs correctly reflect `PowerState`/steam status including the pulsing effect.
+
 ## Session handoff protocol
 
 At the end of every work session, update this file with:
