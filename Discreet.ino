@@ -96,11 +96,16 @@ int pumpDemand = 0;
 // on/off decision would read back stale (and wrong) during exactly the
 // wedged-control-task scenario this whole phase exists to handle: it would
 // keep reporting whatever it was last set to, even after the deadman had
-// already forced the physical pin off. buildTelemetrySnapshot() instead
-// derives snap.heaterOn fresh, every time it's called (from whichever
-// task), directly from ssrAuthorizedUntilMs - the same check
-// ssrDeadmanCallback() itself uses - so telemetry can never show "on" once
-// the deadman has actually taken over.
+// already forced the physical pin off. There was briefly a TelemetrySnapshot
+// field for this (Phase 4-6, derived fresh at buildTelemetrySnapshot() time),
+// but Phase 7 found even that read back stale over HTTP - the snapshot
+// itself is only as fresh as controlTask's last successful cycle - and
+// switched handleGetValues() to recompute heaterOn directly from
+// ssrAuthorizedUntilMs instead, the same check ssrDeadmanCallback() itself
+// uses; the TelemetrySnapshot field became write-only and was removed in
+// Phase 8. Read ssrAuthorizedUntilMs directly (single word, volatile, safe
+// from either task - see its own declaration below) rather than adding a
+// new snapshot field for this again.
 int resolvedPumpPower = 0;
 
 // Declared here (not down in "Phase 6: time-proportional SSR output" with
@@ -155,7 +160,6 @@ double steamSetpoint;
 int offset = 9; // Due to probe location. If you ask for 100 you will get 91, tune this variable.
 
 bool acDetected = false;
-bool PIDonly = false;
 bool shotStarted = false;
 bool pumpPowerSetPreinf = false;
 bool pumpPowerSetExtraction = false;
@@ -211,9 +215,10 @@ FaultCode currentFault = FaultCode::NONE;
 // Latched, per-shot control settings. REWRITE_PLAN.md's "Settings lifecycle"
 // specifically calls out brew temperature, pressure [target] and phase
 // durations as unable to alter a shot already in progress - those four
-// fields live here. Kp/Ki/Kd, offset, steamSetpoint and PIDonly are not
-// called out there and stay as plain, immediately-applied globals,
-// unchanged from Phase 1.
+// fields live here. Kp/Ki/Kd, offset and steamSetpoint are not called out
+// there and stay as plain, immediately-applied globals, unchanged from
+// Phase 1. PIDonly is not a global at all as of Phase 8 - see
+// loadSDConfig(), the only place it's still meaningful.
 struct ControlSettings {
   double setpoint = 0;         // brew target temperature; same offset-adjusted internal representation the old `setpoint` global used
   int preinftime = 8;          // seconds, 0..20
@@ -283,7 +288,13 @@ struct TelemetrySnapshot {
   double temperature;  // offset-corrected, deg C
   double pressure;      // bar
   int pumpPower;         // requested/ramped level, before fault/mode resolution (Phase 0-2 meaning, unchanged)
-  bool heaterOn;          // derived fresh from ssrAuthorizedUntilMs at snapshot-build time (Phase 6) - see buildTelemetrySnapshot()
+  // No heaterOn field here (removed in Phase 8) - it was write-only.
+  // handleGetValues() (its one-time consumer) was switched in Phase 7 to
+  // recompute heaterOn directly from ssrAuthorizedUntilMs instead of
+  // reading a snapshot copy, since the snapshot itself can go stale if
+  // controlTask stops publishing - see ssrAuthorizedUntilMs's own
+  // declaration comment. Recompute from that global directly rather than
+  // adding a field here again.
   int resolvedPumpPower;  // actually written to the dimmer this cycle, after resolution (Phase 3)
   unsigned long elapsedShotTimeMs;
   unsigned long activeSettingsRevision;
@@ -458,12 +469,6 @@ TelemetrySnapshot buildTelemetrySnapshot(unsigned long now) {
   snap.temperature = input - offset;
   snap.pressure = currentPressure;
   snap.pumpPower = pumppower;
-  // Derived fresh, not from a cached global (Phase 6 review) - reads
-  // exactly what ssrDeadmanCallback() itself would compute right now, from
-  // whichever task calls this (controlTask via controlStep(), or loopTask
-  // via handleGetValues()'s fallback), so it can never report "on" once an
-  // authorization has actually gone stale.
-  snap.heaterOn = (long)(ssrAuthorizedUntilMs - now) > 0;
   snap.resolvedPumpPower = resolvedPumpPower;
   snap.elapsedShotTimeMs = acDetected ? elapsedTime : 0;
   snap.activeSettingsRevision = activeSettings.revision;
@@ -613,10 +618,16 @@ bool applyControlCommand(const ControlCommand& cmd) {
       acceptBrewSetpointEdit(constrain(cmd.value, 10 + offset, 96 + offset));
       return true;
     case ControlCommand::Type::SET_MODE:
-      // Keeps the legacy PIDonly mirror in sync, same as loadSDConfig()/
-      // the rest of "/saveConfig" already do - PIDonly is still what gets
-      // persisted to config.json.
-      PIDonly = (cmd.mode == OperatingMode::TEMP_ONLY);
+      // Removed in Phase 8: this used to also write a "legacy PIDonly
+      // mirror" here, on a comment claiming PIDonly was "still what gets
+      // persisted to config.json" - checked directly against the
+      // "/saveConfig" handler and found false: that handler persists the
+      // client's posted JSON verbatim (serializeJson(doc, file)) and never
+      // reads the PIDonly global at all, so this write was never read by
+      // anything (PIDonly's only read is inside loadSDConfig(), right after
+      // its own boot-time write of the same variable - see PHASE8_NOTES.md).
+      // currentMode (this line) has been the actual source of truth since
+      // Phase 2; nothing else needs a mirror of it.
       currentMode = cmd.mode;
       return true;
     // The three cases below (Phase 5 review) move Kp/Ki/Kd/SetTunings(),
@@ -1168,20 +1179,24 @@ void handleGetValues() {
   // operator confirm a fault or a mode restriction actually cut an output,
   // rather than only seeing the (possibly overridden) demand.
   //
-  // heaterOn is recomputed here directly from ssrAuthorizedUntilMs, not
-  // read from snap.heaterOn - found in Phase 7 verification
-  // (docs/PHASE7_NOTES.md "Review round 1"): snap comes from a single
-  // xQueuePeek() near the top of this handler, i.e. whatever controlStep()
-  // last published to telemetryQueue. If controlTask ever wedges, that
-  // snapshot simply stops updating and this handler would keep serving its
-  // last value forever - defeating the exact guarantee the comment on
-  // ssrAuthorizedUntilMs's own declaration promises ("telemetry can never
-  // show 'on' once the deadman has actually taken over"), which holds for
-  // buildTelemetrySnapshot()'s own fresh computation but not for a reader
-  // of its output after the fact. ssrAuthorizedUntilMs is safe to read
-  // directly from loopTask the same way buildTelemetrySnapshot() already
-  // does from either task (single word, volatile, no queue needed - see
-  // its own declaration comment); same wraparound-safe idiom.
+  // heaterOn is computed here directly from ssrAuthorizedUntilMs, not from
+  // a TelemetrySnapshot field - found in Phase 7 verification
+  // (docs/PHASE7_NOTES.md "Review round 1"): a snapshot field here would
+  // come from a single xQueuePeek() near the top of this handler, i.e.
+  // whatever controlStep() last published to telemetryQueue. If
+  // controlTask ever wedges, that snapshot simply stops updating and this
+  // handler would keep serving its last value forever - defeating the
+  // exact guarantee the comment on ssrAuthorizedUntilMs's own declaration
+  // promises ("telemetry can never show 'on' once the deadman has actually
+  // taken over"), which holds for buildTelemetrySnapshot()'s own fresh
+  // computation but not for a reader of its output after the fact.
+  // TelemetrySnapshot briefly had a heaterOn field for this (Phase 4-6);
+  // it became write-only the moment this line stopped reading it, and was
+  // removed in Phase 8 rather than left as a trap for the next snapshot
+  // consumer to reach for. ssrAuthorizedUntilMs is safe to read directly
+  // from loopTask the same way buildTelemetrySnapshot() already does from
+  // either task (single word, volatile, no queue needed - see its own
+  // declaration comment); same wraparound-safe idiom.
   // resolvedPumpPower has no equivalent always-fresh source to fall back
   // to (unlike the heater, the pump has no independent deadman - see
   // PHASE7_NOTES.md Gap 2) - it is only ever as fresh as controlTask's last
@@ -1556,13 +1571,20 @@ void startSD(){
 void loadSDConfig() {
   startSD();
 
+  // PIDonly used to be a global (removed in Phase 8 - see the comment on
+  // applyControlCommand()'s SET_MODE case for why); it's only ever
+  // meaningful here, converting config.json's persisted "PIDonly" field
+  // into the boot-time currentMode below, so it's local to this function
+  // now.
+  bool PIDonly = false;
+
   // Read config
   File configFile = SD.open("/config.json");
   if (configFile) {
     StaticJsonDocument<256> doc;
     deserializeJson(doc, configFile);
     configFile.close();
-    
+
     ssid = doc["ssid"] | "";
     password = doc["password"] | "";
     Kp = doc["Kp"] | Kp;

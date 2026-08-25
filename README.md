@@ -6,9 +6,11 @@ Private development repository for an experimental two-task FreeRTOS refactor of
 
 ## Current status
 
-Phases 0 through 8 of the staged rewrite plan are merged to `main`, tagged
-through `v2.0.6-beta`. The architecture change described below is complete
-and code-reviewed at every stage - see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+Phases 0 through 7 of the staged rewrite plan are merged to `main`, tagged
+through `v2.0.6-beta`; Phase 8 (cleanup and handoff - this section, the
+architecture doc and the test procedure linked below) is complete and under
+review, not yet merged/tagged. The architecture change described below is
+complete and code-reviewed at every stage - see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
 for the resulting task/queue/timing design and **[docs/PHASE7_NOTES.md](docs/PHASE7_NOTES.md)**
 for a code-level safety audit against a 16-item checklist (which found and
 fixed two severe pre-existing bugs, and documented five further gaps still
@@ -74,8 +76,9 @@ The intended sequence is:
 8. verify the result - a code-level audit against a bench checklist, standing in for the live hardware validation this environment couldn't run
 9. clean up, document and decide how to feed focused changes upstream
 
-All nine steps above are done at the code level (`v2.0.6-beta`); the bench
-verification every one of them still needs is tracked in
+Steps 1-8 are done at the code level and merged (`v2.0.6-beta`); step 9 is
+complete and under review, not yet merged/tagged. The bench verification
+every one of them still needs is tracked in
 [docs/HARDWARE_TEST_PROCEDURE.md](docs/HARDWARE_TEST_PROCEDURE.md), not this
 list.
 

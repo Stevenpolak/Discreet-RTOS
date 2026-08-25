@@ -292,16 +292,29 @@ Exit condition: the hardware/bench checklist passes and results are recorded.
       `light.setBrightness()`/`digitalWrite(BUZZER_PIN, ...)` call site -
       actuator ownership was already fully centralized by Phase 3/6 (one
       write site per actuator, verified by grep, no duplication found).
-      Two genuinely dead globals removed: `lastPrintTime` (declared,
-      referenced nowhere else - superseded by `loop()`'s own local
-      `lastReportMs` since Phase 5) and `brewTemp` (declared, never
-      written anywhere, only ever read into a permanently-empty `/getValues`
-      field - confirmed unread by the shipped front end before removing).
+      Four genuinely dead globals/fields removed, the last two found in
+      this phase's own review: `lastPrintTime` (never referenced -
+      superseded by `loop()`'s own local `lastReportMs` since Phase 5);
+      `brewTemp` (never written anywhere, only ever read into a
+      permanently-empty `/getValues` field - confirmed unread by the
+      shipped front end before removing); `TelemetrySnapshot::heaterOn`
+      (write-only since Phase 7 switched `handleGetValues()` to recompute
+      it directly from `ssrAuthorizedUntilMs` instead - the field itself
+      became a trap for the next snapshot consumer, not just unused code);
+      the `PIDonly` global (duplicated `currentMode`, and its one live-
+      session write was never read by anything - `/saveConfig` persists
+      the client's JSON verbatim and never reads that global at all, so a
+      comment claiming it was "still what gets persisted to config.json"
+      was factually wrong - now a local inside `loadSDConfig()`, the only
+      place it's still meaningful). Full detail in `PHASE8_NOTES.md`.
 - [x] Document task boundaries, queue schemas and timing. See
       [ARCHITECTURE.md](ARCHITECTURE.md) - the three execution contexts,
-      what may write which actuator/global from where, the two queues'
-      schemas and producer/consumer contracts, and a consolidated timing
-      constants table.
+      what may write which actuator/global from where (including the
+      buzzer's mutex, the one place this firmware takes a real cross-task
+      lock), the two queues' schemas and producer/consumer contracts, the
+      `OperatingMode`/`ShotState`/`FaultCode` state model and the
+      `activeSettings`/`shotSettings`/`pendingSettings` latch, and a
+      consolidated timing constants table.
 - [x] Document configuration migration, if any. See ARCHITECTURE.md
       "Configuration persistence" - `config.json`'s schema is unchanged by
       this entire rewrite (confirmed against the shipped front end and
@@ -312,7 +325,14 @@ Exit condition: the hardware/bench checklist passes and results are recorded.
       item from every phase's own notes, consolidated into one ordered
       runbook, prioritized starting with the two items Phase 7 identified as
       highest-priority (pressure sensor fault convention, over-temperature
-      reachability).
+      reachability). This phase's own review found the first draft had
+      silently dropped several Phase 5/6 bench items in the consolidation
+      (heater/PID response validation, the SSR time-proportional constants'
+      real-hardware appropriateness, duty-cycle quantization, esp_timer core
+      affinity, a pre-load-test timing baseline, and the combined-stress
+      case) and one step that read as contradicting `PHASE7_NOTES.md` Gap 2
+      (the pump-deadman gap) rather than testing it - all fixed; see
+      `PHASE8_NOTES.md`.
 - [x] Update this checklist and the root README. This checklist, above; see
       the root [README.md](../README.md) for the corresponding update.
 - [x] Decide whether changes should be proposed upstream as one or several
@@ -325,25 +345,40 @@ Exit condition: the hardware/bench checklist passes and results are recorded.
 [Discreet-Coffee/Discreet](https://github.com/Discreet-Coffee/Discreet), a
 real, separately-maintained open-source project (see the root README's
 "Credits and license"). Recommendation: **several small, independently
--reviewable PRs, not one large one**, roughly in this order, each of which
-already exists as its own reviewed, tagged commit range in this repo's
-history and could be cherry-picked/rebased onto upstream's `main` largely
-as-is:
+-reviewable PRs, not one large one**, in this order - checked against the
+actual upstream tree (`git apply --check` of each candidate range against
+upstream's real `main`, not just read against this repo's own history; see
+`PHASE8_NOTES.md` "Review round 1" for the two ordering mistakes an earlier
+draft of this section made and how they were found):
 
-1. Phase 1's non-blocking buzzer and loop-count-timing fixes (small,
-   behavior-preserving, easiest to review and merge independently).
-2. Phase 3's actuator-ownership centralization and fault/mode priority
-   resolution (the single-write-site guarantee and the fault-forces-pump
-   -off fix - a real bug fix upstream likely wants regardless of the rest
-   of this rewrite).
-3. The two-task architecture itself (Phases 2, 4, 5, 6 together - these
-   depend on each other and don't split further cleanly).
-4. Phase 7's five bug fixes (stuck-low thermocouple, PID tunings never
-   applied, unclamped boot setpoint, stale `heaterOn` telemetry) - genuinely
-   independent of the architecture change, since all five are real bugs in
-   logic upstream also has today, not specific to this rewrite's new
-   structure. Worth proposing on their own, soonest, regardless of whether
-   upstream has any interest in the broader two-task rewrite.
+1. **Phase 1's non-blocking buzzer and loop-count-timing fixes.**
+   Confirmed to apply cleanly against upstream's actual `main` as-is. One
+   caveat worth calling out in the PR description rather than presenting as
+   purely behavior-preserving: it also adds `light.setBrightness(0)` on
+   shot-end, a real (small, good) behavior change, not a no-op.
+2. **The three Phase 7 bug fixes that don't depend on this rewrite's own
+   infrastructure**: the stuck-low thermocouple check, `loadSDConfig()`
+   never calling `myPID.SetTunings()`, and the unclamped boot-time setpoint.
+   Each confirmed against upstream's actual code (same `isnan()`/`< 0`/
+   `> 160` guard, same single `SetTunings()` call site inside
+   `/saveConfig`, same unclamped `loadSDConfig()`) - these are real bugs in
+   logic upstream has today, unrelated to the architecture change, worth
+   proposing on their own, soonest. The fourth Phase 7 fix (stale
+   `heaterOn` telemetry) does **not** belong in this group - it depends on
+   `ssrAuthorizedUntilMs` (Phase 6) and `telemetryQueue` (Phase 4), neither
+   of which exists upstream, so it isn't portable in isolation.
+3. **Phase 2's data model together with Phase 3's actuator-ownership
+   centralization**, as one PR, not two. An earlier draft of this section
+   proposed Phase 3 on its own, "before" the two-task architecture - checked
+   against upstream and found wrong: Phase 3's fault/mode priority
+   resolution is written directly in terms of Phase 2's `OperatingMode`/
+   `ShotState`/`FaultCode` enums (`currentFault != FaultCode::NONE`, etc.),
+   which don't exist upstream at all (upstream has only a bare `PIDonly`
+   bool). Phase 3 cannot be proposed before the vocabulary it's written in.
+4. **The rest of the two-task architecture** (Phases 4, 5, 6 together -
+   command/telemetry queues, the dedicated control task, the SSR deadman;
+   these depend on each other and don't split further cleanly), once 1-3
+   above have landed or been evaluated.
 
 Not recommended for upstream in their current state: anything still marked
 as a documented, un-bench-verified gap in `PHASE7_NOTES.md` - those need
