@@ -4,6 +4,19 @@ Private development repository for an experimental two-task FreeRTOS refactor of
 
 > This project is derived from **[Discreet Coffee / Discreet](https://github.com/Discreet-Coffee/Discreet)**. All credit for the original project, firmware, hardware concept and web interface belongs to the Discreet Coffee project and its contributors. This repository is an independent development copy and does not imply endorsement by the upstream maintainers.
 
+## Current status
+
+Phases 0 through 8 of the staged rewrite plan are merged to `main`, tagged
+through `v2.0.6-beta`. The architecture change described below is complete
+and code-reviewed at every stage - see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+for the resulting task/queue/timing design and **[docs/PHASE7_NOTES.md](docs/PHASE7_NOTES.md)**
+for a code-level safety audit against a 16-item checklist (which found and
+fixed two severe pre-existing bugs, and documented five further gaps still
+open). **None of it has been verified on real hardware yet** - this
+environment had no physical machine available for any phase of this work.
+See **[docs/HARDWARE_TEST_PROCEDURE.md](docs/HARDWARE_TEST_PROCEDURE.md)**
+before installing this on a machine.
+
 ## Original project
 
 [Discreet](https://github.com/Discreet-Coffee/Discreet) is an open-source ESP32-based espresso-machine controller, designed around the Gaggia Classic Pro and usable with other single-boiler machines. Its features include:
@@ -57,13 +70,18 @@ The intended sequence is:
 4. centralize actuator ownership
 5. add command and telemetry queues
 6. move the control boundary into one FreeRTOS task
-7. validate timing and safety under service-side load
-8. consider the SSR improvement separately
+7. consider the SSR improvement separately
+8. verify the result - a code-level audit against a bench checklist, standing in for the live hardware validation this environment couldn't run
 9. clean up, document and decide how to feed focused changes upstream
+
+All nine steps above are done at the code level (`v2.0.6-beta`); the bench
+verification every one of them still needs is tracked in
+[docs/HARDWARE_TEST_PROCEDURE.md](docs/HARDWARE_TEST_PROCEDURE.md), not this
+list.
 
 ## Safety status
 
-This is experimental firmware for mains-powered heating and pumping hardware. It is not ready for installation merely because it builds. Any change must be bench-tested with safe boot outputs, sensor-fault handling, over-temperature protection, time-outs and watchdog recovery verified before use on a machine.
+This is experimental firmware for mains-powered heating and pumping hardware. It is not ready for installation merely because it builds. Any change must be bench-tested with safe boot outputs, sensor-fault handling, over-temperature protection, time-outs and watchdog recovery verified before use on a machine - see [docs/HARDWARE_TEST_PROCEDURE.md](docs/HARDWARE_TEST_PROCEDURE.md) for the full, ordered procedure, and [docs/PHASE7_NOTES.md](docs/PHASE7_NOTES.md) for the known, documented gaps to be aware of before testing (most notably: no invalid-pressure-sensor detection, and an over-temperature fault that does not latch).
 
 ## Credits and license
 

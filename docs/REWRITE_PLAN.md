@@ -287,12 +287,67 @@ Exit condition: the hardware/bench checklist passes and results are recorded.
 
 ### Phase 8 — Cleanup and handoff
 
-- [ ] Remove obsolete globals and duplicate actuator paths.
-- [ ] Document task boundaries, queue schemas and timing.
-- [ ] Document configuration migration, if any.
-- [ ] Add a concise hardware test procedure.
-- [ ] Update this checklist and the root README.
-- [ ] Decide whether changes should be proposed upstream as one or several focused pull requests.
+- [x] Remove obsolete globals and duplicate actuator paths. Audited every
+      global declaration and every `digitalWrite(SSR_PIN, ...)`/
+      `light.setBrightness()`/`digitalWrite(BUZZER_PIN, ...)` call site -
+      actuator ownership was already fully centralized by Phase 3/6 (one
+      write site per actuator, verified by grep, no duplication found).
+      Two genuinely dead globals removed: `lastPrintTime` (declared,
+      referenced nowhere else - superseded by `loop()`'s own local
+      `lastReportMs` since Phase 5) and `brewTemp` (declared, never
+      written anywhere, only ever read into a permanently-empty `/getValues`
+      field - confirmed unread by the shipped front end before removing).
+- [x] Document task boundaries, queue schemas and timing. See
+      [ARCHITECTURE.md](ARCHITECTURE.md) - the three execution contexts,
+      what may write which actuator/global from where, the two queues'
+      schemas and producer/consumer contracts, and a consolidated timing
+      constants table.
+- [x] Document configuration migration, if any. See ARCHITECTURE.md
+      "Configuration persistence" - `config.json`'s schema is unchanged by
+      this entire rewrite (confirmed against the shipped front end and
+      `loadSDConfig()`/`/saveConfig`); no migration is needed for an
+      existing install's config file.
+- [x] Add a concise hardware test procedure. See
+      [HARDWARE_TEST_PROCEDURE.md](HARDWARE_TEST_PROCEDURE.md) - every bench
+      item from every phase's own notes, consolidated into one ordered
+      runbook, prioritized starting with the two items Phase 7 identified as
+      highest-priority (pressure sensor fault convention, over-temperature
+      reachability).
+- [x] Update this checklist and the root README. This checklist, above; see
+      the root [README.md](../README.md) for the corresponding update.
+- [x] Decide whether changes should be proposed upstream as one or several
+      focused pull requests. See "Upstream contribution" below - a
+      recommendation, not an action taken by this phase; opening a PR
+      against a third-party repository needs the user's own explicit
+      go-ahead, not something to do unilaterally.
+
+**Upstream contribution.** This repository is a development copy of
+[Discreet-Coffee/Discreet](https://github.com/Discreet-Coffee/Discreet), a
+real, separately-maintained open-source project (see the root README's
+"Credits and license"). Recommendation: **several small, independently
+-reviewable PRs, not one large one**, roughly in this order, each of which
+already exists as its own reviewed, tagged commit range in this repo's
+history and could be cherry-picked/rebased onto upstream's `main` largely
+as-is:
+
+1. Phase 1's non-blocking buzzer and loop-count-timing fixes (small,
+   behavior-preserving, easiest to review and merge independently).
+2. Phase 3's actuator-ownership centralization and fault/mode priority
+   resolution (the single-write-site guarantee and the fault-forces-pump
+   -off fix - a real bug fix upstream likely wants regardless of the rest
+   of this rewrite).
+3. The two-task architecture itself (Phases 2, 4, 5, 6 together - these
+   depend on each other and don't split further cleanly).
+4. Phase 7's five bug fixes (stuck-low thermocouple, PID tunings never
+   applied, unclamped boot setpoint, stale `heaterOn` telemetry) - genuinely
+   independent of the architecture change, since all five are real bugs in
+   logic upstream also has today, not specific to this rewrite's new
+   structure. Worth proposing on their own, soonest, regardless of whether
+   upstream has any interest in the broader two-task rewrite.
+
+Not recommended for upstream in their current state: anything still marked
+as a documented, un-bench-verified gap in `PHASE7_NOTES.md` - those need
+this repo's own hardware validation first, not a second team's.
 
 ### Phase 9 — Physical controls: power/sleep, steam button, status LEDs
 

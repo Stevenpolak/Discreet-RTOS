@@ -142,13 +142,11 @@ unsigned long lastPIDTime = 0;
 unsigned long DimlastUpdate = 0;
 unsigned long lastPumpAdjust = 0;
 unsigned long LastPressCall = 0;
-unsigned long lastPrintTime = 0;
 unsigned long acDetectedTime = 0;
 unsigned long elapsedTime = 0; // Shot time in milliseconds
 int actime = 0;  // Shot time in seconds
 
 //Steam Veriables
-String brewTemp;
 bool steaming = false;       // temperature-threshold hysteresis flag (steam() sets it once input reaches steamSetpoint-5); drives the steam-ready beep, not the setpoint mirror.
 bool steamRequested = false; // set by the "steam"/"stopsteam" /adjust commands (Phase 2); the setpoint-mirror guard - see acceptBrewSetpointEdit().
 double steamSetpoint;
@@ -1152,7 +1150,6 @@ void handleGetValues() {
   doc["Kp"] = Kp;
   doc["Ki"] = Ki;
   doc["Kd"] = Kd;
-  doc["brewTemp"] = brewTemp;
   doc["steamSetpoint"] = steamSetpoint;
 
   // New in Phase 2: explicit mode/state/fault and settings-revision fields.
