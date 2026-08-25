@@ -486,20 +486,28 @@ TelemetrySnapshot buildTelemetrySnapshot(unsigned long now) {
 // Accepts an edit to one of the three latched int fields. While idle it
 // takes effect immediately (there is no in-progress shot to protect);
 // mid-shot it only updates pendingSettings and is promoted to
-// activeSettings when the shot returns to IDLE (see loop()'s shot-end
-// handling below).
+// activeSettings when the shot returns to IDLE (see endShot() below).
 //
 // "Idle" here is `!acDetected`, not `currentShotState == ShotState::IDLE`.
 // currentShotState is a telemetry label, not a control input: the FAULT
-// override at the end of loop() sets it to FAULT even while genuinely idle
+// override inside controlStep() (Phase 3; moved there from loop() by Phase
+// 5 - this comment previously said "the end of loop()", stale since then,
+// found in Phase 7 verification) sets it to FAULT even while genuinely idle
 // (freezing every edit for as long as a fault is latched, with no shot
-// required to clear it), and it holds COMPLETE for one iteration after
-// shot-end into the next iteration's server.handleClient() (line ~1006),
-// before the `else` branch reassigns IDLE - a request serviced in that
-// window would otherwise be treated as mid-shot even though the shot has
-// already ended and its settings already promoted. acDetected does not
-// have either problem: it is cleared synchronously at shot-end (before
-// promotion runs) and is never touched by fault handling.
+// required to clear it). currentShotState also briefly reports COMPLETE
+// for one controlStep() cycle after shot-end before the next cycle's
+// `else` branch reassigns IDLE - before Phase 5, a request arriving in
+// that same-iteration window (loop() called controlStep() and
+// server.handleClient() back to back) could have been treated as mid-shot
+// even though the shot had already ended and its settings already
+// promoted; that specific ordering no longer exists post-Phase-5
+// (controlTask and loopTask are independent - see docs/PHASE5_NOTES.md),
+// and COMPLETE itself is effectively unobservable from the web side now
+// (telemetryQueue is depth 1 and the next 10ms cycle overwrites it with
+// IDLE - see docs/PHASE7_NOTES.md), but the underlying reason to prefer
+// acDetected still holds regardless: it is cleared synchronously at
+// shot-end (before promotion runs) and is never touched by fault handling,
+// where currentShotState is neither.
 void acceptPreinftimeEdit(int newValue) {
   pendingSettings.preinftime = newValue;
   pendingSettings.revision++;
@@ -1162,7 +1170,27 @@ void handleGetValues() {
   // is the requested/ramped level before that resolution. Lets a bench
   // operator confirm a fault or a mode restriction actually cut an output,
   // rather than only seeing the (possibly overridden) demand.
-  doc["heaterOn"] = snap.heaterOn;
+  //
+  // heaterOn is recomputed here directly from ssrAuthorizedUntilMs, not
+  // read from snap.heaterOn - found in Phase 7 verification
+  // (docs/PHASE7_NOTES.md "Review round 1"): snap comes from a single
+  // xQueuePeek() near the top of this handler, i.e. whatever controlStep()
+  // last published to telemetryQueue. If controlTask ever wedges, that
+  // snapshot simply stops updating and this handler would keep serving its
+  // last value forever - defeating the exact guarantee the comment on
+  // ssrAuthorizedUntilMs's own declaration promises ("telemetry can never
+  // show 'on' once the deadman has actually taken over"), which holds for
+  // buildTelemetrySnapshot()'s own fresh computation but not for a reader
+  // of its output after the fact. ssrAuthorizedUntilMs is safe to read
+  // directly from loopTask the same way buildTelemetrySnapshot() already
+  // does from either task (single word, volatile, no queue needed - see
+  // its own declaration comment); same wraparound-safe idiom.
+  // resolvedPumpPower has no equivalent always-fresh source to fall back
+  // to (unlike the heater, the pump has no independent deadman - see
+  // PHASE7_NOTES.md Gap 2) - it is only ever as fresh as controlTask's last
+  // successful cycle regardless of how it's read, so there is nothing this
+  // handler can do differently for it.
+  doc["heaterOn"] = (long)(ssrAuthorizedUntilMs - millis()) > 0;
   doc["resolvedPumpPower"] = snap.resolvedPumpPower;
 
   // Use a buffer to generate the JSON, then send it
@@ -1214,6 +1242,30 @@ void getCurrentTheme() {
 const int FAULT_CLEAR_STABLE_READINGS = 3;
 int faultClearStreak = 0;
 
+// Found in Phase 7 verification (docs/PHASE7_NOTES.md "Review round 1"):
+// `input < 0` above was dead code - MAX6675::readCelsius() (see
+// max6675.cpp) returns `v * 0.25` for a non-negative uint16_t `v`, which can
+// never be negative, so that arm could never fire. Its only explicit fault
+// signal is NAN, raised solely when the chip's own open-thermocouple bit is
+// set; a different link failure (lost sensor power, a stuck-low MISO line -
+// thermoDO/GPIO21 has no internal pull and floats/sticks on a bad
+// connection) reads back as a numerically valid, unflagged 0.00C. That
+// value passes every check here, and the PID then saturates output to 255
+// at a ~102C error with no fault raised and no other backstop (the SSR
+// deadman and Task WDT both protect against a wedged/crashed control task,
+// not a healthy task computing a wrong answer from bad sensor data).
+// MIN_PLAUSIBLE_TEMP_C replaces the dead `< 0` check with a real, if
+// conservative, lower bound - mirrors the existing `> 160` bound's own
+// reasoning (a value no real indoor espresso machine boiler should ever
+// plausibly report while the sensor is genuinely connected and reading),
+// not a guess at this specific sensor's fault-signaling convention (see
+// PHASE7_NOTES.md's pressure-sensor gap for why that distinction matters).
+// TODO(bench): 5C is a conservative starting point, not a measurement -
+// confirm it clears on a real cold boot in the coldest expected ambient
+// this machine will actually see, same as every other constant in this
+// file marked TODO(bench).
+const double MIN_PLAUSIBLE_TEMP_C = 5;
+
 void runPID() {
 
   unsigned long PIDnow = millis();
@@ -1223,7 +1275,7 @@ void runPID() {
 
     input = thermocouple.readCelsius();
 
-    if (isnan(input) || input < 0 || input > 160) {
+    if (isnan(input) || input < MIN_PLAUSIBLE_TEMP_C || input > 160) {
       currentFault = FaultCode::INVALID_TEMPERATURE;
       faultClearStreak = 0;
       heaterDemand = 0;
@@ -1543,6 +1595,38 @@ void loadSDConfig() {
   // could no longer be allowed to disagree.
   setpoint = setpoint + offset;
   steamSetpoint = steamSetpoint + offset;
+
+  // Found in Phase 7 verification (docs/PHASE7_NOTES.md "Review round 1"):
+  // /saveConfig (setupServerRoutes()) writes the client's JSON to
+  // config.json before any validation runs - the live-session clamp only
+  // ever applies to the in-memory value the queued SET_BREW_SETPOINT_ABSOLUTE
+  // command sets, not to what ends up on the SD card. Without this, an
+  // out-of-range value saved once (e.g. a typo) would load back unclamped
+  // on every subsequent boot, indefinitely, past what any client-side or
+  // live-session validation ever sees again. Same bound
+  // SET_BREW_SETPOINT_ABSOLUTE already uses (applyControlCommand()) -
+  // constant with the live-session behavior, not a new judgement call.
+  // steamSetpoint/offset are deliberately left unclamped here, matching
+  // their existing total lack of validation everywhere else in this file
+  // (Phase 5 review: "No new validation is added beyond what each already
+  // had (none)") - clamping only one of the three would be inconsistent
+  // without first deciding real bounds for the other two, which is a
+  // separate, undiscussed change.
+  setpoint = constrain(setpoint, 10 + offset, 96 + offset);
+
+  // Found in the same pass: loadSDConfig() set the Kp/Ki/Kd *globals* from
+  // config.json but never called myPID.SetTunings() - PID_v1's constructor
+  // (Discreet.ino:66) captures Kp/Ki/Kd once, at static-init time, into its
+  // own private kp/ki/kd copies; changing the globals afterward has no
+  // effect on the running controller. Every boot silently regulated on the
+  // compile-time defaults (48/8/50) instead of whatever config.json/the
+  // no-config fallback just set, until a user happened to open /saveConfig
+  // and resubmit tunings (the one call site that already did call
+  // SetTunings(), via the SET_TUNINGS queued command) - and /getValues
+  // reported the unused globals throughout, so a bench tuning session
+  // conducted through the config page was reading one gain set while the
+  // controller ran another.
+  myPID.SetTunings(Kp, Ki, Kd);
 
   currentMode = PIDonly ? OperatingMode::TEMP_ONLY : OperatingMode::NORMAL;
 

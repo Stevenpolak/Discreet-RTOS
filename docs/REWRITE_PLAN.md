@@ -248,13 +248,23 @@ Exit condition: the SSR uses the available PID resolution (bounded by `SSR_ENFOR
 
 A code-level verification pass against every item below - what the code
 actually guarantees vs. what still needs a real machine - is recorded in
-`docs/PHASE7_NOTES.md`, including two real gaps it found (no invalid-
-pressure-sensor detection; no independent deadman for the pump, unlike the
-heater's since Phase 6). Checkboxes below stay unchecked: this phase's exit
-condition requires bench results this environment cannot produce, and code-
-level verification is not a substitute for it - see `PHASE7_NOTES.md` for
-which items are logic-guaranteed today and exactly what to run on real
-hardware to close out each one.
+`docs/PHASE7_NOTES.md`. An independent 6-agent review of that pass found it
+had overstated several verdicts and, more importantly, surfaced two severe
+defects unrelated to any single checklist item (a stuck-low thermocouple
+reading as a valid 0C and saturating the heater with no fault raised; PID
+tunings loaded from `config.json` never actually reaching the running
+controller) - both fixed in code this phase, along with three smaller
+fixes. Five real, understood gaps remain deliberately undone rather than
+guessed at (no invalid-pressure-sensor detection; no independent deadman for
+the pump; OTA doesn't transition the pump/shot to a safe state; a
+fault-triggered mid-shot restart can command full pump power into an
+already-pressurized group; the over-temperature fault doesn't latch) - see
+`PHASE7_NOTES.md`'s "Review round 1" for the full reasoning on each.
+Checkboxes below stay unchecked: this phase's exit condition requires bench
+results this environment cannot produce, and code-level verification is not
+a substitute for it - see `PHASE7_NOTES.md` for which items are
+logic-guaranteed today and exactly what to run on real hardware to close out
+each one.
 
 - [ ] Temp-only heats and regulates temperature while shot logic and pump remain inactive.
 - [ ] Normal shot detection enters and exits every intended phase correctly.
